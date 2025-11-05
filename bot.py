@@ -7,6 +7,7 @@ class Bot:
         self.init_paths = None
         self.init_edges = None
         self.initialized = False
+        self.used_tiles = set()
         print("Initializing your super mega duper bot")
 
     def get_next_move(self, game_message: TeamGameState):
@@ -40,6 +41,10 @@ class Bot:
 
         colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
 
+        # Persistent global memory for used tiles
+        if not hasattr(self, "used_tiles"):
+            self.used_tiles = set()
+
         for i, path in enumerate(self.init_paths):
             if remaining <= 0 or current_total >= max_total:
                 break
@@ -48,8 +53,8 @@ class Bot:
             while idx < len(path) and remaining > 0 and current_total < max_total:
                 x, y = path[idx]
 
-                # skip colonies
-                if (x, y) in colony_positions:
+                # skip colony or previously used tiles
+                if (x, y) in colony_positions or (x, y) in self.used_tiles:
                     idx += 1
                     continue
 
@@ -57,9 +62,11 @@ class Bot:
                     actions.append(AddBiomassAction(position=Position(x, y), amount=1))
                     remaining -= 1
                     current_total += 1
+                    self.used_tiles.add((x, y))  # track globally
+
                 idx += 1
 
-            # remember how far we got
+            # remember how far we got for this path
             self.init_progress[i] = idx
 
         # check if all paths are done
@@ -83,9 +90,12 @@ class Bot:
     def mst_edges(self, colonies):
         if len(colonies) < 2:
             return []
+
         connected = [colonies[0]]
         remaining = colonies[1:]
         edges = []
+
+        # --- Prim’s algorithm to connect all colonies ---
         while remaining:
             best_pair = None
             best_dist = float("inf")
@@ -98,10 +108,28 @@ class Bot:
             edges.append(best_pair)
             connected.append(best_pair[1])
             remaining.remove(best_pair[1])
+
+        # --- Try to close the loop only if it's new (not overlapping existing paths) ---
         first_colony = colonies[0]
-        last_colony = connected[-1]
-        if first_colony != last_colony:
+        last_colony = colonies[-1]
+
+        # Generate the potential closing path
+        close_path = self.line_between(first_colony.position, last_colony.position)
+
+        # Flatten existing MST paths into a set of coordinates
+        existing_tiles = set()
+        for c1, c2 in edges:
+            path = self.line_between(c1.position, c2.position)
+            existing_tiles.update(path)
+
+        # Compute overlap ratio
+        overlap = sum(1 for tile in close_path if tile in existing_tiles)
+        overlap_ratio = overlap / len(close_path)
+
+        # Add closing edge only if it's mostly unique (less than 40% overlap)
+        if overlap_ratio < 0.4:
             edges.append((first_colony, last_colony))
+
         return edges
 
     def rank_paths(self, game_message: TeamGameState):
