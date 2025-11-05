@@ -11,6 +11,7 @@ class Bot:
         print("Initializing your super mega duper bot")
 
     def get_next_move(self, game_message: TeamGameState):
+        # Initialize MST and paths if not done yet
         if not self.init_edges or not self.init_paths or not self.init_progress:
             self.init_edges = self.mst_edges(game_message.map.colonies)
             self.init_paths = [self.line_between(c1.position, c2.position) for c1, c2 in self.init_edges]
@@ -24,13 +25,17 @@ class Bot:
                 print("✅ All colonies connected!")
             return actions
 
-        # After network is complete → reinforcement phase
+        # --- Reinforcement phase ---
         ranked = self.rank_paths(game_message)
         if not ranked:
             return []
 
         best_score, best_path, _ = ranked[0]
         return self.reinforce_path(game_message, best_path)
+
+    # -------------------------------------------------------
+    # --- INITIAL CONNECTION PHASE ---------------------------
+    # -------------------------------------------------------
 
     def continue_connect_all_paths(self, game_message: TeamGameState):
         """Continue connecting all MST paths across multiple ticks until done."""
@@ -41,10 +46,6 @@ class Bot:
 
         colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
 
-        # Persistent global memory for used tiles
-        if not hasattr(self, "used_tiles"):
-            self.used_tiles = set()
-
         for i, path in enumerate(self.init_paths):
             if remaining <= 0 or current_total >= max_total:
                 break
@@ -53,7 +54,7 @@ class Bot:
             while idx < len(path) and remaining > 0 and current_total < max_total:
                 x, y = path[idx]
 
-                # skip colony or previously used tiles
+                # skip colonies or already-used tiles
                 if (x, y) in colony_positions or (x, y) in self.used_tiles:
                     idx += 1
                     continue
@@ -62,20 +63,25 @@ class Bot:
                     actions.append(AddBiomassAction(position=Position(x, y), amount=1))
                     remaining -= 1
                     current_total += 1
-                    self.used_tiles.add((x, y))  # track globally
+                    self.used_tiles.add((x, y))
 
                 idx += 1
 
             # remember how far we got for this path
             self.init_progress[i] = idx
 
-        # check if all paths are done
+        # mark as done when all paths complete
         if all(p >= len(path) for p, path in zip(self.init_progress, self.init_paths)):
             self.initialized = True
 
         return actions
 
+    # -------------------------------------------------------
+    # --- PATH GENERATION -----------------------------------
+    # -------------------------------------------------------
+
     def line_between(self, start: Position, end: Position):
+        """Return a Manhattan path (no diagonals) between two points."""
         path = []
         x, y = start.x, start.y
         while x != end.x:
@@ -88,6 +94,7 @@ class Bot:
         return path
 
     def mst_edges(self, colonies):
+        """Compute MST edges and close the loop only if it adds a new unique connection."""
         if len(colonies) < 2:
             return []
 
@@ -95,7 +102,7 @@ class Bot:
         remaining = colonies[1:]
         edges = []
 
-        # --- Prim’s algorithm to connect all colonies ---
+        # --- Prim’s algorithm ---
         while remaining:
             best_pair = None
             best_dist = float("inf")
@@ -109,14 +116,12 @@ class Bot:
             connected.append(best_pair[1])
             remaining.remove(best_pair[1])
 
-        # --- Try to close the loop only if it's new (not overlapping existing paths) ---
+        # --- Try to close the loop only if it's unique ---
         first_colony = colonies[0]
         last_colony = colonies[-1]
-
-        # Generate the potential closing path
         close_path = self.line_between(first_colony.position, last_colony.position)
 
-        # Flatten existing MST paths into a set of coordinates
+        # Get all existing path tiles
         existing_tiles = set()
         for c1, c2 in edges:
             path = self.line_between(c1.position, c2.position)
@@ -126,48 +131,66 @@ class Bot:
         overlap = sum(1 for tile in close_path if tile in existing_tiles)
         overlap_ratio = overlap / len(close_path)
 
-        # Add closing edge only if it's mostly unique (less than 40% overlap)
+        # Add closing edge only if it creates a new distinct route
         if overlap_ratio < 0.4:
             edges.append((first_colony, last_colony))
 
         return edges
 
+    # -------------------------------------------------------
+    # --- REINFORCEMENT PHASE -------------------------------
+    # -------------------------------------------------------
+
     def rank_paths(self, game_message: TeamGameState):
-        """Return a sorted list of (score, path, (colony1, colony2)) from best to worst."""
+        """Rank all paths based on potential gain (strong colonies, short paths, weak links)."""
         paths_with_scores = []
 
         for c1, c2 in self.mst_edges(game_message.map.colonies):
             path = self.line_between(c1.position, c2.position)
             path_length = len(path)
+
             c1_val = c1.nutrients
             c2_val = c2.nutrients
+            path_tiles = [(x, y) for (x, y) in path
+                          if 0 <= x < game_message.map.width and 0 <= y < game_message.map.height]
 
-            # basic efficiency score
-            score = (c1_val + c2_val) / (1 + path_length)
+            # Compute current strength (min biomass along path)
+            path_strength = min(game_message.map.biomass[x][y] for (x, y) in path_tiles)
+            max_strength = min(c1_val, c2_val)
+            potential_gain = max_strength - path_strength
 
-            # only add if we have enough biomass to build or reinforce
-            needed_biomass = sum(1 for (x, y) in path if game_message.map.biomass[x][y] < 5)
-            if needed_biomass <= game_message.availableBiomass:
-                paths_with_scores.append((score, path, (c1, c2)))
+            # Skip paths already maxed out
+            if potential_gain <= 0:
+                continue
 
-        # sort by score descending
+            # Weighted score (higher for high-value, short, weak paths)
+            score = potential_gain * (c1_val + c2_val) / (1 + path_length)
+
+            paths_with_scores.append((score, path, (c1, c2)))
+
         paths_with_scores.sort(key=lambda x: x[0], reverse=True)
         return paths_with_scores
 
     def reinforce_path(self, game_message: TeamGameState, path):
-        """Add +1 biomass everywhere along a path (excluding colony tiles)."""
-        print(f'remaining biomass to place: {game_message.availableBiomass}')
+        """Reinforce weakest tiles first along a path, skipping colonies."""
+        print(f'number of resources left: {game_message.availableBiomass}')
         actions = []
         remaining = game_message.maximumNumberOfBiomassPerTurn
         current_total = sum(sum(row) for row in game_message.map.biomass)
         max_total = game_message.maximumNumberOfBiomassOnMap
 
         colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
-
-        # exclude colonies from reinforcement path
         clean_path = [(x, y) for (x, y) in path if (x, y) not in colony_positions]
 
-        for (x, y) in clean_path:
+        # Find weakest biomass value in this path
+        if not clean_path:
+            return actions
+
+        min_strength = min(game_message.map.biomass[x][y] for (x, y) in clean_path)
+        weakest_tiles = [(x, y) for (x, y) in clean_path if game_message.map.biomass[x][y] == min_strength]
+
+        # Reinforce the weakest tiles first
+        for (x, y) in weakest_tiles:
             if remaining <= 0 or current_total >= max_total:
                 break
             actions.append(AddBiomassAction(position=Position(x, y), amount=1))
@@ -175,4 +198,3 @@ class Bot:
             current_total += 1
 
         return actions
-
