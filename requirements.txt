@@ -1,0 +1,2 @@
+websockets==15.0.1
+dataclasses-json==0.6.7
