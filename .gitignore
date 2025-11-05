@@ -2,3 +2,4 @@ typescript/GameInterface.ts
 java/src/main/java/codes/blitz/challenge/generated
 csharp/GameMessage.cs
 python/game_message.py
+.idea
