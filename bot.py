@@ -1,51 +1,150 @@
-import random
+import math
 from game_message import *
-
 
 class Bot:
     def __init__(self):
+        self.init_progress = None
+        self.init_paths = None
+        self.init_edges = None
+        self.initialized = False
         print("Initializing your super mega duper bot")
 
     def get_next_move(self, game_message: TeamGameState):
+        if not self.init_edges or not self.init_paths or not self.init_progress:
+            self.init_edges = self.mst_edges(game_message.map.colonies)
+            self.init_paths = [self.line_between(c1.position, c2.position) for c1, c2 in self.init_edges]
+            self.init_progress = [0] * len(self.init_paths)
+            self.initialized = False
+
+        # Continue initial connection phase until all paths complete
+        if not self.initialized:
+            actions = self.continue_connect_all_paths(game_message)
+            if self.initialized:
+                print("✅ All colonies connected!")
+            return actions
+
+        # After network is complete → reinforcement phase
+        ranked = self.rank_paths(game_message)
+        if not ranked:
+            return []
+
+        best_score, best_path, _ = ranked[0]
+        return self.reinforce_path(game_message, best_path)
+
+    def continue_connect_all_paths(self, game_message: TeamGameState):
+        """Continue connecting all MST paths across multiple ticks until done."""
         actions = []
+        remaining = game_message.maximumNumberOfBiomassPerTurn
+        current_total = sum(sum(row) for row in game_message.map.biomass)
+        max_total = game_message.maximumNumberOfBiomassOnMap
 
-        # Pick a number of biomass to move this turn.
-        remaining_biomass_to_move_this_turn = random.randint(
-            1, game_message.maximumNumberOfBiomassPerTurn
-        )
+        colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
 
-        while remaining_biomass_to_move_this_turn > 0:
-            random_position = Position(
-                x=random.randint(0, game_message.map.width - 1),
-                y=random.randint(0, game_message.map.height - 1),
-            )
+        for i, path in enumerate(self.init_paths):
+            if remaining <= 0 or current_total >= max_total:
+                break
 
-            # Randomly decide whether to add or remove biomass
-            should_add_biomass = random.choice([True, False])
+            idx = self.init_progress[i]
+            while idx < len(path) and remaining > 0 and current_total < max_total:
+                x, y = path[idx]
 
-            if should_add_biomass:
-                biomass_to_move_in_this_action = random.randint(
-                    1, remaining_biomass_to_move_this_turn
-                )
-                remaining_biomass_to_move_this_turn -= biomass_to_move_in_this_action
+                # skip colonies
+                if (x, y) in colony_positions:
+                    idx += 1
+                    continue
 
-                actions.append(
-                    AddBiomassAction(
-                        position=random_position, amount=biomass_to_move_in_this_action
-                    )
-                )
-            else:
-                biomass_to_move_in_this_action = min(
-                    remaining_biomass_to_move_this_turn,
-                    game_message.map.biomass[random_position.x][random_position.y],
-                )
-                remaining_biomass_to_move_this_turn -= biomass_to_move_in_this_action
+                if game_message.map.biomass[x][y] == 0:
+                    actions.append(AddBiomassAction(position=Position(x, y), amount=1))
+                    remaining -= 1
+                    current_total += 1
+                idx += 1
 
-                actions.append(
-                    RemoveBiomassAction(
-                        position=random_position, amount=biomass_to_move_in_this_action
-                    )
-                )
+            # remember how far we got
+            self.init_progress[i] = idx
 
-        # You can clearly do better than the random actions above. Have fun!!
+        # check if all paths are done
+        if all(p >= len(path) for p, path in zip(self.init_progress, self.init_paths)):
+            self.initialized = True
+
         return actions
+
+    def line_between(self, start: Position, end: Position):
+        path = []
+        x, y = start.x, start.y
+        while x != end.x:
+            path.append((x, y))
+            x += 1 if end.x > x else -1
+        while y != end.y:
+            path.append((x, y))
+            y += 1 if end.y > y else -1
+        path.append((end.x, end.y))
+        return path
+
+    def mst_edges(self, colonies):
+        if len(colonies) < 2:
+            return []
+        connected = [colonies[0]]
+        remaining = colonies[1:]
+        edges = []
+        while remaining:
+            best_pair = None
+            best_dist = float("inf")
+            for c1 in connected:
+                for c2 in remaining:
+                    d = abs(c1.position.x - c2.position.x) + abs(c1.position.y - c2.position.y)
+                    if d < best_dist:
+                        best_dist = d
+                        best_pair = (c1, c2)
+            edges.append(best_pair)
+            connected.append(best_pair[1])
+            remaining.remove(best_pair[1])
+        first_colony = colonies[0]
+        last_colony = connected[-1]
+        if first_colony != last_colony:
+            edges.append((first_colony, last_colony))
+        return edges
+
+    def rank_paths(self, game_message: TeamGameState):
+        """Return a sorted list of (score, path, (colony1, colony2)) from best to worst."""
+        paths_with_scores = []
+
+        for c1, c2 in self.mst_edges(game_message.map.colonies):
+            path = self.line_between(c1.position, c2.position)
+            path_length = len(path)
+            c1_val = c1.nutrients
+            c2_val = c2.nutrients
+
+            # basic efficiency score
+            score = (c1_val + c2_val) / (1 + path_length)
+
+            # only add if we have enough biomass to build or reinforce
+            needed_biomass = sum(1 for (x, y) in path if game_message.map.biomass[x][y] < 5)
+            if needed_biomass <= game_message.availableBiomass:
+                paths_with_scores.append((score, path, (c1, c2)))
+
+        # sort by score descending
+        paths_with_scores.sort(key=lambda x: x[0], reverse=True)
+        return paths_with_scores
+
+    def reinforce_path(self, game_message: TeamGameState, path):
+        """Add +1 biomass everywhere along a path (excluding colony tiles)."""
+        print(f'remaining biomass to place: {game_message.availableBiomass}')
+        actions = []
+        remaining = game_message.maximumNumberOfBiomassPerTurn
+        current_total = sum(sum(row) for row in game_message.map.biomass)
+        max_total = game_message.maximumNumberOfBiomassOnMap
+
+        colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
+
+        # exclude colonies from reinforcement path
+        clean_path = [(x, y) for (x, y) in path if (x, y) not in colony_positions]
+
+        for (x, y) in clean_path:
+            if remaining <= 0 or current_total >= max_total:
+                break
+            actions.append(AddBiomassAction(position=Position(x, y), amount=1))
+            remaining -= 1
+            current_total += 1
+
+        return actions
+
