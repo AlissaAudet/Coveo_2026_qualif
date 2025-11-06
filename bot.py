@@ -4,108 +4,100 @@ from game_message import *
 
 class Bot:
     def __init__(self):
-        self.skip_next_add = False
+        self.mode = "add"
+        self.connecting_phase = True
         self.init_edges = None
         self.init_paths = None
         self.init_progress = None
         self.initialized = False
         self.used_tiles = set()
-        self.active_paths = []  # [(path, (c1, c2))]
-        self.last_ranked = []
-        self.last_recalc_tick = -1
+        self.active_paths = []      # [(path, (c1, c2))]
+        self.current_path = None    # (path, pair)
+        self.path_queue = []        # [(x, y)] tiles left to process
         print("Initializing your super mega duper bot")
 
     # ---------------------------------------------------------
-    # --- MAIN DECISION LOOP ---------------------------------
+    # MAIN LOOP
     # ---------------------------------------------------------
     def get_next_move(self, game_message: TeamGameState):
-        tick = getattr(game_message, "currentTickNumber", getattr(game_message, "tick", 0))
         actions = []
-
-        # --- 0. skip one add tick after freeing biomass ---
-        if hasattr(self, "skip_next_add") and self.skip_next_add:
-            self.skip_next_add = False
-            print("⏸️ Skipping add phase (waiting for biomass removal to apply)")
-            return []
-
-        # --- 1. prevent total biomass overflow ---
         total_biomass = sum(sum(row) for row in game_message.map.biomass)
-        if total_biomass >= game_message.maximumNumberOfBiomassOnMap:
-            remove_actions, freed = self.remove_worst_path(game_message)
-            if freed > 0:
-                print(f"⚠️ Biomass cap reached ({total_biomass}), freeing {freed}")
-                self.skip_next_add = True  # pause 1 tick before adding again
-                return remove_actions
+        cap = game_message.maximumNumberOfBiomassOnMap
 
-        # --- 2. connect all colonies initially ---
-        if not self.initialized:
-            if not self.init_edges:
-                self.init_edges = self.mst_edges(game_message.map.colonies)
-                self.init_paths = [self.line_between(c1.position, c2.position) for c1, c2 in self.init_edges]
-                self.init_progress = [0] * len(self.init_paths)
-
+        # --- 1. Connecting phase ---
+        if self.connecting_phase:
             actions = self.connect_all_colonies(game_message)
             if self.initialized:
+                self.connecting_phase = False
                 self.active_paths = list(zip(self.init_paths, self.init_edges))
-                print("✅ All colonies connected!")
+                print("✅ All colonies connected — entering strategic mode!")
             return actions
 
-        # --- 3. reinforce the most valuable path ---
-        ranked = self.rank_paths(game_message)
-        if not ranked:
-            return []
+        # --- 2. Handle full biomass cap (force removal) ---
+        if total_biomass >= cap:
+            if self.mode != "remove" or not self.path_queue:
+                self.mode = "remove"
+                self.select_worst_path_for_remove(game_message)
+                # If no valid path, remove the weakest non-colony tile
+                if not self.path_queue:
+                    weakest_tile = self.find_weakest_tile(game_message)
+                    if weakest_tile:
+                        x, y = weakest_tile
+                        print(f"⚠️ Forced single-tile removal at ({x},{y}) due to biomass cap.")
+                        return [RemoveBiomassAction(position=Position(x, y), amount=1)]
+            return self.process_remove_phase(game_message)
 
-        best_score, best_path, best_pair = ranked[0]
-        actions = self.reinforce_path(game_message, best_path)
+        # --- 3. Choose new path only when previous done ---
+        if not self.path_queue and not self.current_path:
+            if self.mode == "add":
+                self.select_best_path_for_add(game_message)
+            else:
+                self.select_worst_path_for_remove(game_message)
 
-        # --- 4. if nothing was done, reallocate weakest path ---
-        if not actions:
-            remove_actions, freed = self.remove_worst_path(game_message)
-            if freed > 0:
-                ranked = self.rank_paths(game_message)
-                if ranked:
-                    best_score, best_path, _ = ranked[0]
-                    add_actions = self.build_best_new_path(game_message, freed)
-                    actions = remove_actions + add_actions
-                    print("♻️ Forced reallocation: removed weakest path to make progress")
-                self.skip_next_add = True  # also pause after forced reallocation
-                return actions
+        # --- 4. Perform current mode work ---
+        if self.mode == "add":
+            actions = self.process_add_phase(game_message)
+        else:
+            actions = self.process_remove_phase(game_message)
 
-        # --- 5. safety: if all paths removed, rebuild top 3 ---
-        if self.initialized and not self.active_paths:
-            ranked = self.rank_paths(game_message)
-            if ranked:
-                best = ranked[:3]
-                self.active_paths = [(p, pair) for _, p, pair in best]
-                print("🌱 Rebuilt initial active paths to keep growing")
+        # --- 5. Fallback only if under capacity ---
+        if not actions and total_biomass < cap - 2:
+            actions = self.reinforce_random_tile(game_message)
 
         return actions[:game_message.maximumNumberOfBiomassPerTurn]
 
     # ---------------------------------------------------------
-    # --- INITIAL CONNECTION PHASE ----------------------------
+    # INITIAL CONNECTION PHASE
     # ---------------------------------------------------------
     def connect_all_colonies(self, game_message: TeamGameState):
-        """Gradually connect all MST paths with biomass."""
         actions = []
         remaining = game_message.maximumNumberOfBiomassPerTurn
-        current_total = sum(sum(row) for row in game_message.map.biomass)
-        max_total = game_message.maximumNumberOfBiomassOnMap
-        colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
+        total = sum(sum(row) for row in game_message.map.biomass)
+        cap = game_message.maximumNumberOfBiomassOnMap
+        colonies = {(c.position.x, c.position.y) for c in game_message.map.colonies}
+
+        if not self.init_edges:
+            self.init_edges = self.mst_edges(game_message.map.colonies)
+            self.init_paths = [
+                self.line_between(c1.position, c2.position)
+                for c1, c2 in self.init_edges
+            ]
+            self.init_progress = [0] * len(self.init_paths)
 
         for i, path in enumerate(self.init_paths):
-            if remaining <= 0 or current_total >= max_total:
+            if remaining <= 0 or total >= cap:
                 break
             idx = self.init_progress[i]
-            while idx < len(path) and remaining > 0 and current_total < max_total:
+            while idx < len(path) and remaining > 0 and total < cap:
                 x, y = path[idx]
-                if (x, y) in colony_positions or (x, y) in self.used_tiles:
+                if (x, y) in colonies or (x, y) in self.used_tiles:
                     idx += 1
                     continue
                 if game_message.map.biomass[x][y] == 0:
                     actions.append(AddBiomassAction(position=Position(x, y), amount=1))
                     self.used_tiles.add((x, y))
                     remaining -= 1
-                    current_total += 1
+                    total += 1
                 idx += 1
             self.init_progress[i] = idx
 
@@ -114,10 +106,99 @@ class Bot:
         return actions
 
     # ---------------------------------------------------------
-    # --- PATH GENERATION -------------------------------------
+    # PATH SELECTION
+    # ---------------------------------------------------------
+    def select_best_path_for_add(self, game_message):
+        ranked = self.rank_paths(game_message)
+        if not ranked:
+            print("⚠️ No valid ADD path found.")
+            return
+        best_score, best_path, best_pair = ranked[0]
+        colonies = {(c.position.x, c.position.y) for c in game_message.map.colonies}
+        self.path_queue = [(x, y) for (x, y) in best_path if (x, y) not in colonies]
+        self.current_path = (best_path, best_pair)
+        print(f"🌿 Selected ADD path {best_pair[0].position} ↔ {best_pair[1].position}")
+
+    def select_worst_path_for_remove(self, game_message):
+        if not self.active_paths:
+            self.path_queue = []
+            return
+        worst = min(self.active_paths, key=lambda p: self.path_future_value(game_message, *p))
+        path, pair = worst
+        self.path_queue = path.copy()
+        self.current_path = (path, pair)
+        self.active_paths.remove(worst)
+        print(f"🧹 Selected REMOVE path {pair[0].position} ↔ {pair[1].position}")
+
+    # ---------------------------------------------------------
+    # ADD / REMOVE EXECUTION
+    # ---------------------------------------------------------
+    def process_add_phase(self, game_message):
+        actions = []
+        remaining = game_message.maximumNumberOfBiomassPerTurn
+        total = sum(sum(row) for row in game_message.map.biomass)
+        cap = game_message.maximumNumberOfBiomassOnMap
+
+        if not self.path_queue:
+            return []
+
+        while self.path_queue and remaining > 0 and total < cap:
+            x, y = self.path_queue.pop(0)
+            if game_message.map.biomass[x][y] < 10:
+                actions.append(AddBiomassAction(position=Position(x, y), amount=1))
+                remaining -= 1
+                total += 1
+
+        # Path finished → store it and prepare to switch mode
+        if not self.path_queue:
+            if self.current_path:
+                self.active_paths.append(self.current_path)
+                print(f"✅ Finished reinforcing path {self.current_path[1][0].position} ↔ {self.current_path[1][1].position}")
+            self.current_path = None
+            self.mode = "remove"
+        return actions
+
+    def process_remove_phase(self, game_message):
+        actions = []
+        remaining = game_message.maximumNumberOfBiomassPerTurn
+
+        if not self.path_queue:
+            return []
+
+        while self.path_queue and remaining > 0:
+            x, y = self.path_queue.pop(0)
+            biomass_here = game_message.map.biomass[x][y]
+            if biomass_here > 0:
+                actions.append(RemoveBiomassAction(position=Position(x, y), amount=1))
+                remaining -= 1
+
+        # Path finished → prepare to add next time
+        if not self.path_queue:
+            print(f"🗑️ Finished removing path {self.current_path[1][0].position} ↔ {self.current_path[1][1].position}")
+            self.current_path = None
+            self.mode = "add"
+        return actions
+
+    # ---------------------------------------------------------
+    # BACKUP ACTION
+    # ---------------------------------------------------------
+    def reinforce_random_tile(self, game_message):
+        """Fallback only if biomass not full."""
+        total = sum(sum(row) for row in game_message.map.biomass)
+        cap = game_message.maximumNumberOfBiomassOnMap
+        if total >= cap - 1:
+            return []
+        for x in range(game_message.map.width):
+            for y in range(game_message.map.height):
+                if game_message.map.biomass[x][y] == 0:
+                    print(f"🧩 Reinforcing backup tile ({x},{y})")
+                    return [AddBiomassAction(position=Position(x, y), amount=1)]
+        return []
+
+    # ---------------------------------------------------------
+    # UTILITIES
     # ---------------------------------------------------------
     def line_between(self, start: Position, end: Position):
-        """Return Manhattan path (no diagonals)."""
         path = []
         x, y = start.x, start.y
         while x != end.x:
@@ -130,7 +211,6 @@ class Bot:
         return path
 
     def mst_edges(self, colonies):
-        """Basic Prim’s MST (connects all colonies minimally)."""
         if len(colonies) < 2:
             return []
         connected = [colonies[0]]
@@ -149,26 +229,21 @@ class Bot:
         return edges
 
     # ---------------------------------------------------------
-    # --- FUTURE VALUE + TREND PREDICTION ---------------------
+    # SCORING
     # ---------------------------------------------------------
     def colony_future_value(self, colony, horizon=15):
-        """Estimate colony value based on its next few ticks."""
         if hasattr(colony, "futureNutrients") and colony.futureNutrients:
             lookahead = colony.futureNutrients[:horizon]
             return sum(lookahead) / len(lookahead)
         return colony.nutrients
 
     def colony_future_trend(self, colony, horizon=10):
-        """Estimate if colony value is rising or falling."""
         if hasattr(colony, "futureNutrients") and len(colony.futureNutrients) > 1:
             now = colony.nutrients
             future = sum(colony.futureNutrients[:horizon]) / min(horizon, len(colony.futureNutrients))
             return future - now
         return 0
 
-    # ---------------------------------------------------------
-    # --- DYNAMIC SCORING + REINFORCEMENT ---------------------
-    # ---------------------------------------------------------
     def rank_paths(self, game_message: TeamGameState):
         colonies = game_message.map.colonies
         results = []
@@ -183,90 +258,29 @@ class Bot:
                 trend = self.colony_future_trend(c1) + self.colony_future_trend(c2)
                 path_strength = min(game_message.map.biomass[x][y] for (x, y) in path)
                 max_strength = min(c1_val, c2_val)
-                gain = max_strength - path_strength + 0.5 * trend
-                if gain <= 0:
-                    continue
+                gain = max(0.1, max_strength - path_strength + 0.5 * trend)
                 score = gain * (c1_val + c2_val) / (1 + path_length)
                 results.append((score, path, (c1, c2)))
         results.sort(key=lambda x: x[0], reverse=True)
         return results
 
-    def reinforce_path(self, game_message: TeamGameState, path):
-        """Reinforce weakest tiles first along path, skipping colonies."""
-        actions = []
-        remaining = game_message.maximumNumberOfBiomassPerTurn
-        colony_positions = {(c.position.x, c.position.y) for c in game_message.map.colonies}
-        clean = [(x, y) for (x, y) in path if (x, y) not in colony_positions]
-        if not clean:
-            return actions
-        min_strength = min(game_message.map.biomass[x][y] for (x, y) in clean)
-        weak_tiles = [(x, y) for (x, y) in clean if game_message.map.biomass[x][y] == min_strength]
-        for (x, y) in weak_tiles:
-            if remaining <= 0:
-                break
-            actions.append(AddBiomassAction(position=Position(x, y), amount=1))
-            remaining -= 1
-        return actions
-
-    # ---------------------------------------------------------
-    # --- REALLOCATION (REMOVE/REBUILD PATHS) -----------------
-    # ---------------------------------------------------------
     def path_future_value(self, game_message, path, pair, horizon=15):
-        """Predict a path’s long-term value using future colony nutrients."""
         c1, c2 = pair
         c1_future = self.colony_future_value(c1, horizon)
         c2_future = self.colony_future_value(c2, horizon)
         path_strength = min(game_message.map.biomass[x][y] for (x, y) in path)
         return min(c1_future, path_strength) * min(c2_future, path_strength)
 
-    def remove_worst_path(self, game_message):
-        """Remove the path with the lowest predicted future value safely."""
-        if not self.active_paths:
-            return [], 0
-
-        worst = min(self.active_paths, key=lambda p: self.path_future_value(game_message, *p))
-        path, pair = worst
-
-        actions = []
-        freed = 0
-        per_turn_limit = game_message.maximumNumberOfBiomassPerTurn
-        used_this_turn = 0
-
-        for (x, y) in path:
-            if used_this_turn >= per_turn_limit:
-                break
-
-            tile_amount = game_message.map.biomass[x][y]
-            if tile_amount <= 0:
-                continue
-
-            amount = min(tile_amount, per_turn_limit - used_this_turn)
-            actions.append(RemoveBiomassAction(position=Position(x, y), amount=amount))
-            used_this_turn += amount
-            freed += amount
-
-        if freed > 0:
-            self.active_paths.remove(worst)
-            p1, p2 = pair[0].position, pair[1].position
-            print(f"🧹 Removed path ({p1.x},{p1.y}) ↔ ({p2.x},{p2.y}) — freed {freed}")
-
-        return actions, freed
-
-    def build_best_new_path(self, game_message, freed):
-        """Rebuild a new high-value path after freeing biomass."""
-        ranked = self.rank_paths(game_message)
-        if not ranked:
-            return []
-
-        for score, path, pair in ranked:
-            expected_value = self.path_future_value(game_message, path, pair)
-            if expected_value > 0:
-                self.active_paths.append((path, pair))
-                p1, p2 = pair[0].position, pair[1].position
-                print(f"🌱 Built new path ({p1.x},{p1.y}) ↔ ({p2.x},{p2.y}) (future value {expected_value:.2f})")
-
-                max_tiles = min(freed, game_message.maximumNumberOfBiomassPerTurn)
-                return [AddBiomassAction(position=Position(x, y), amount=1)
-                        for (x, y) in path[:max_tiles]]
-
-        return []
+    def find_weakest_tile(self, game_message):
+        """Find a non-colony tile with some biomass to remove when stuck."""
+        colonies = {(c.position.x, c.position.y) for c in game_message.map.colonies}
+        weakest = None
+        weakest_val = float("inf")
+        for x in range(game_message.map.width):
+            for y in range(game_message.map.height):
+                if (x, y) not in colonies:
+                    val = game_message.map.biomass[x][y]
+                    if 0 < val < weakest_val:
+                        weakest_val = val
+                        weakest = (x, y)
+        return weakest
