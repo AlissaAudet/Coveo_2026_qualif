@@ -50,6 +50,23 @@ ENEMY_MARGIN_BEFORE_AGGRO = 2     # cautious before AGGRO_TICK
 ENEMY_MARGIN_AFTER_AGGRO = 0      # more aggressive after AGGRO_TICK
 NEUTRAL_MARGIN = 2              # less averse to neutral spores
 
+# ============================================================
+# ASSASSIN (KILL MODE) CONSTANTS
+# ============================================================
+
+ASSASSIN_ENABLE = True
+ASSASSIN_TICK = 250               # start hunting at this tick
+ASSASSIN_MAX_ASSASSINS = 2        # how many hunters at once
+ASSASSIN_MIN_BIOMASS = 10         # must be this big to hunt
+ASSASSIN_KILL_MARGIN = 1          # must be > enemy_biomass + margin to step onto them
+ASSASSIN_PATH_MARGIN = 0          # extra safety while walking (0 = allow equal fights only if rules allow)
+ASSASSIN_MAX_PATH_COST = 18       # dijkstra budget for "clear path"
+ASSASSIN_TARGET_MAX_DIST = 25     # ignore very far targets (manhattan pre-filter)
+
+# Target preference
+ASSASSIN_PREFER_BIG_TARGETS = True
+ASSASSIN_TARGET_BONUS_PER_BIOMASS = 3
+
 
 # ============================================================
 # Strategy state per spore
@@ -314,6 +331,161 @@ class Bot:
             actions.append(SpawnerProduceSporeAction(spawnerId=spawner.id, biomass=bio))
             team.nutrients -= bio  # local budget
 
+    def _neighbors4(self, world: GameWorld, p: PositionTuple) -> list[PositionTuple]:
+        x, y = p
+        out: list[PositionTuple] = []
+        for dx, dy in DIRS:
+            nx, ny = x + dx, y + dy
+            if self._in_bounds(world, nx, ny):
+                out.append((nx, ny))
+        return out
+
+    def _assassin_safe_to_enter(
+        self,
+        pos: PositionTuple,
+        spore_biomass: int,
+        tick: int,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+    ) -> bool:
+        """
+        Slight variant: allow hunting, but require stronger-than + margins.
+        """
+        e = enemy_strength.get(pos, 0)
+        n = neutral_strength.get(pos, 0)
+
+        # Path safety margin (walking through occupied tiles)
+        if e > 0 and spore_biomass <= e + ASSASSIN_PATH_MARGIN:
+            return False
+        if n > 0 and spore_biomass <= n + ASSASSIN_PATH_MARGIN:
+            return False
+        return True
+
+    def _assassin_can_kill_target(
+        self,
+        target_pos: PositionTuple,
+        spore_biomass: int,
+        enemy_strength: Dict[PositionTuple, int],
+    ) -> bool:
+        e = enemy_strength.get(target_pos, 0)
+        return e > 0 and spore_biomass > e + ASSASSIN_KILL_MARGIN
+
+    def _assassin_has_clear_path(
+        self,
+        world: GameWorld,
+        start: PositionTuple,
+        goal: PositionTuple,
+        spore_biomass: int,
+        tick: int,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+    ) -> bool:
+        """
+        Dijkstra reachability check with safety constraints.
+        """
+        def neighbors_fn(p: PositionTuple) -> list[PositionTuple]:
+            return self._neighbors4(world, p)
+
+        def cost_fn(a: PositionTuple, b: PositionTuple) -> int:
+            # Allow stepping onto goal if we can kill it; else block.
+            if b == goal:
+                return 1 if self._assassin_can_kill_target(goal, spore_biomass, enemy_strength) else -1
+
+            return 1 if self._assassin_safe_to_enter(b, spore_biomass, tick, enemy_strength, neutral_strength) else -1
+
+        dist, _prev = dijkstra(
+            start=start,
+            neighbors_fn=neighbors_fn,
+            cost_fn=cost_fn,
+            is_goal_fn=lambda p: p == goal,
+            max_cost=ASSASSIN_MAX_PATH_COST,
+        )
+        return goal in dist
+
+    def _pick_assassin_targets(
+        self,
+        world: GameWorld,
+        my_id: str,
+        neutral_id: str,
+        tick: int,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+    ) -> list[tuple[str, PositionTuple]]:
+        """
+        Returns list of (sporeId, targetPos) for assassin moves.
+        """
+        if not ASSASSIN_ENABLE or tick < ASSASSIN_TICK:
+            return []
+
+        # Candidate assassin spores: biggest biomass
+        my_spores = [s for s in world.teamInfos[my_id].spores if s.biomass >= max(2, ASSASSIN_MIN_BIOMASS)]
+        my_spores.sort(key=lambda s: s.biomass, reverse=True)
+        my_spores = my_spores[:ASSASSIN_MAX_ASSASSINS]
+
+        if not my_spores:
+            return []
+
+        # List enemy spores positions with their biomass
+        enemy_spores: list[tuple[PositionTuple, int]] = []
+        for s in world.spores:
+            if s.teamId == my_id or s.teamId == neutral_id:
+                continue
+            enemy_spores.append(((s.position.x, s.position.y), s.biomass))
+
+        if not enemy_spores:
+            return []
+
+        orders: list[tuple[str, PositionTuple]] = []
+        reserved_targets: set[PositionTuple] = set()
+
+        for hunter in my_spores:
+            start = (hunter.position.x, hunter.position.y)
+
+            best_target: Optional[PositionTuple] = None
+            best_score = -10**9
+
+            for pos, ebio in enemy_spores:
+                if pos in reserved_targets:
+                    continue
+
+                # quick distance filter
+                if abs(pos[0] - start[0]) + abs(pos[1] - start[1]) > ASSASSIN_TARGET_MAX_DIST:
+                    continue
+
+                # must be killable
+                if hunter.biomass <= ebio + ASSASSIN_KILL_MARGIN:
+                    continue
+
+                # clear path check (this is the expensive part)
+                if not self._assassin_has_clear_path(
+                    world=world,
+                    start=start,
+                    goal=pos,
+                    spore_biomass=hunter.biomass,
+                    tick=tick,
+                    enemy_strength=enemy_strength,
+                    neutral_strength=neutral_strength,
+                ):
+                    continue
+
+                # scoring
+                score = 0
+                if ASSASSIN_PREFER_BIG_TARGETS:
+                    score += ebio * ASSASSIN_TARGET_BONUS_PER_BIOMASS
+
+                # prefer closer (more reliable kills)
+                score -= (abs(pos[0] - start[0]) + abs(pos[1] - start[1])) * 2
+
+                if score > best_score:
+                    best_score = score
+                    best_target = pos
+
+            if best_target is not None:
+                    orders.append((hunter.id, best_target))
+                    reserved_targets.add(best_target)
+
+            return orders
+
     # ----------------------------
     # Main decision
     # ----------------------------
@@ -338,6 +510,7 @@ class Bot:
                 s = my_team.spores[0]
                 p = (s.position.x, s.position.y)
 
+                # IMPORTANT: avoid spawner collision
                 if not self._has_spawner_at(world, p):
                     actions.append(SporeCreateSpawnerAction(sporeId=s.id))
             return actions
@@ -364,13 +537,19 @@ class Bot:
             plan = self.plans[sp.id]
             plan.ring_max = ring_max
 
-            # If hub missing or stolen by another reservation, repick
             hub_invalid = (
                 plan.hub is None
                 or (plan.hub in self.reserved_hubs and self.reserved_hubs[plan.hub] != sp.id)
             )
             if hub_invalid:
-                hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
+                hub = self._pick_best_hub(
+                    world=world,
+                    my_id=my_id,
+                    neutral_id=neutral_id,
+                    tick=tick,
+                    enemy_strength=enemy_strength,
+                    neutral_strength=neutral_strength,
+                )
                 if hub is not None:
                     plan.hub = hub
                     plan.mode = "SEEK"
@@ -395,6 +574,26 @@ class Bot:
         # Track spores that already used an action (create spawner uses spore action)
         used_spores = {a.sporeId for a in actions if hasattr(a, "sporeId")}
 
+        # 5.5) ASSASSIN override: hunt enemy spores if clear path + enough biomass
+        assassin_orders = self._pick_assassin_targets(
+            world=world,
+            my_id=my_id,
+            neutral_id=neutral_id,
+            tick=tick,
+            enemy_strength=enemy_strength,
+            neutral_strength=neutral_strength,
+        )
+        for sid, tgt in assassin_orders:
+            if sid in used_spores:
+                continue
+            actions.append(
+                SporeMoveToAction(
+                    sporeId=sid,
+                    position=Position(x=tgt[0], y=tgt[1]),
+                )
+            )
+            used_spores.add(sid)
+
         # 6) Move spores: SEEK hub -> RING fill -> new hub
         for sp in my_team.spores:
             if sp.id in used_spores:
@@ -414,7 +613,15 @@ class Bot:
             if not self._safe_to_enter(plan.hub, sp.biomass, tick, enemy_strength, neutral_strength):
                 if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                     del self.reserved_hubs[plan.hub]
-                new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
+
+                new_hub = self._pick_best_hub(
+                    world=world,
+                    my_id=my_id,
+                    neutral_id=neutral_id,
+                    tick=tick,
+                    enemy_strength=enemy_strength,
+                    neutral_strength=neutral_strength,
+                )
                 if new_hub is not None:
                     plan.hub = new_hub
                     self.reserved_hubs[new_hub] = sp.id
@@ -424,8 +631,6 @@ class Bot:
 
             if plan.mode == "SEEK":
                 if sp_pos != plan.hub:
-                    # Aggressive after AGGRO_TICK: keep seeking even if it’s enemy-owned,
-                    # but still filtered by _safe_to_enter above.
                     actions.append(
                         SporeMoveToAction(
                             sporeId=sp.id,
@@ -455,7 +660,14 @@ class Bot:
                     if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                         del self.reserved_hubs[plan.hub]
 
-                    new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
+                    new_hub = self._pick_best_hub(
+                        world=world,
+                        my_id=my_id,
+                        neutral_id=neutral_id,
+                        tick=tick,
+                        enemy_strength=enemy_strength,
+                        neutral_strength=neutral_strength,
+                    )
                     if new_hub is not None:
                         plan.hub = new_hub
                         self.reserved_hubs[new_hub] = sp.id
