@@ -25,136 +25,97 @@ class SporePlan:
 
 class Bot:
     def __init__(self):
-        print("Bot: territory-first, hub+ring expansion, many small claim spores")
+        print("Bot: hub -> ring fill, territory-first, safe spawner creation")
         self.plans: Dict[str, SporePlan] = {}
         self.reserved_hubs: Dict[PositionTuple, str] = {}  # hub -> sporeId
 
-    # ---------- Map helpers ----------
-    @staticmethod
-    def _dirs() -> List[PositionTuple]:
-        return [(0, -1), (0, 1), (-1, 0), (1, 0)]
-
-    @staticmethod
-    def _dir_pos(dx: int, dy: int) -> Position:
-        return Position(x=dx, y=dy)
-
+    # ----------------------------
+    # Helpers map / grids (grid[y][x])
+    # ----------------------------
     @staticmethod
     def _in_bounds(world: GameWorld, x: int, y: int) -> bool:
         return 0 <= x < world.map.width and 0 <= y < world.map.height
 
-    def _neighbors(self, world: GameWorld, p: PositionTuple) -> List[PositionTuple]:
-        x, y = p
-        out: List[PositionTuple] = []
-        for dx, dy in self._dirs():
-            nx, ny = x + dx, y + dy
-            if self._in_bounds(world, nx, ny):
-                out.append((nx, ny))
-        return out
-
-    def _nut(self, world: GameWorld, p: PositionTuple) -> int:
+    @staticmethod
+    def _nut(world: GameWorld, p: PositionTuple) -> int:
         x, y = p
         return world.map.nutrientGrid[y][x]
 
-    def _owner(self, world: GameWorld, p: PositionTuple) -> str:
-        x, y = p
-        return world.ownershipGrid[y][x]
-
-    def _bio_tile(self, world: GameWorld, p: PositionTuple) -> int:
+    @staticmethod
+    def _tile_biomass(world: GameWorld, p: PositionTuple) -> int:
         x, y = p
         return world.biomassGrid[y][x]
 
+    @staticmethod
+    def _tile_owner(world: GameWorld, p: PositionTuple) -> str:
+        x, y = p
+        return world.ownershipGrid[y][x]
+
     def _owned_by_me(self, world: GameWorld, my_id: str, p: PositionTuple) -> bool:
-        # "Controlled tile" = biomass>=1 + ownership==my_id (per docs)
-        return self._owner(world, p) == my_id and self._bio_tile(world, p) >= 1
+        return self._tile_owner(world, p) == my_id and self._tile_biomass(world, p) >= 1
 
-    def _enemy_spores(self, world: GameWorld, my_id: str) -> set[PositionTuple]:
-        s: set[PositionTuple] = set()
-        for sp in world.spores:
-            if sp.teamId != my_id:
-                s.add((sp.position.x, sp.position.y))
-        return s
+    @staticmethod
+    def _has_spawner_at(world: GameWorld, p: PositionTuple) -> bool:
+        x, y = p
+        for spw in world.spawners:
+            if spw.position.x == x and spw.position.y == y:
+                return True
+        return False
 
-    # move cost: 0 on our trace, 1 otherwise; avoid enemy-occupied tile
-    def _cost01(self, world: GameWorld, my_id: str, enemy_pos: set[PositionTuple], a: PositionTuple, b: PositionTuple) -> int:
-        if b in enemy_pos:
-            return -1
-        if self._owned_by_me(world, my_id, b):
-            return 0
-        return 1
+    # ----------------------------
+    # Hub selection (fast)
+    # ----------------------------
+    def _pick_best_hub(self, world: GameWorld, my_id: str) -> Optional[PositionTuple]:
+        best: Optional[PositionTuple] = None
+        best_score = -10**9
 
-    # ---------- Hub selection ----------
-    def _top_hubs(self, world: GameWorld, my_id: str, limit: int = 60) -> List[PositionTuple]:
-        # Prefer high nutrient tiles not already reserved; not caring about distance here (fast).
-        cand: List[Tuple[int, int, PositionTuple]] = []
         for y in range(world.map.height):
             row = world.map.nutrientGrid[y]
             for x in range(world.map.width):
                 v = row[x]
                 if v <= 0:
                     continue
+
                 p = (x, y)
+
+                # Eviter hubs deja reserves par une autre spore
                 if p in self.reserved_hubs and self.reserved_hubs[p] != "":
                     continue
-                # Penalize already-owned tiles a bit so we keep expanding territory
-                owned_pen = 40 if self._owned_by_me(world, my_id, p) else 0
-                cand.append((v - owned_pen, v, p))
-        cand.sort(reverse=True)
-        return [p for _, __, p in cand[:limit]]
 
-    def _pick_hub_reachable(
-        self,
-        world: GameWorld,
-        my_id: str,
-        start: PositionTuple,
-        max_cost: int = 40,
-    ) -> Optional[PositionTuple]:
-        hubs = self._top_hubs(world, my_id, limit=60)
-        if not hubs:
-            return None
+                # Penaliser un peu si deja a nous (on veut expand)
+                score = v - (40 if self._owned_by_me(world, my_id, p) else 0)
 
-        enemy_pos = self._enemy_spores(world, my_id)
+                if score > best_score:
+                    best_score = score
+                    best = p
 
-        def neighbors_fn(p: PositionTuple) -> List[PositionTuple]:
-            return self._neighbors(world, p)
+        return best
 
-        def cost_fn(a: PositionTuple, b: PositionTuple) -> int:
-            return self._cost01(world, my_id, enemy_pos, a, b)
-
-        dist, _ = dijkstra(start, neighbors_fn, cost_fn, is_goal_fn=None, max_cost=max_cost)
-
-        # Choose: reachable with lowest cost; tie: higher nutrient
-        best: Optional[PositionTuple] = None
-        best_key = (10**9, -10**9)  # (cost, -nutrient)
-        for p in hubs:
-            if p not in dist:
-                continue
-            key = (dist[p], -self._nut(world, p))
-            if key < best_key:
-                best_key = key
-                best = p
-
-        return best if best is not None else hubs[0]
-
-    # ---------- Ring fill ----------
+    # ----------------------------
+    # Ring fill (circonference en anneaux carres)
+    # ----------------------------
     def _ring_positions(self, world: GameWorld, hub: PositionTuple, r: int) -> List[PositionTuple]:
-        # Square ring: max(|dx|,|dy|) == r
         hx, hy = hub
         pts: List[PositionTuple] = []
         if r <= 0:
             return pts
 
+        # top
         for x in range(hx - r, hx + r + 1):
             y = hy - r
             if self._in_bounds(world, x, y):
                 pts.append((x, y))
+        # right
         for y in range(hy - r + 1, hy + r + 1):
             x = hx + r
             if self._in_bounds(world, x, y):
                 pts.append((x, y))
+        # bottom
         for x in range(hx + r - 1, hx - r - 1, -1):
             y = hy + r
             if self._in_bounds(world, x, y):
                 pts.append((x, y))
+        # left
         for y in range(hy + r - 1, hy - r, -1):
             x = hx - r
             if self._in_bounds(world, x, y):
@@ -177,7 +138,6 @@ class Bot:
             for k in range(n):
                 idx = (plan.ring_i + k) % n
                 p = ring[idx]
-                # Territory-first: try to take any not-controlled tile (even nutrient 0) for score.
                 if not self._owned_by_me(world, my_id, p):
                     plan.ring_i = (idx + 1) % n
                     return p
@@ -187,208 +147,170 @@ class Bot:
 
         return None
 
-    # ---------- One-step safe move (fast) ----------
-    def _move_one_step(self, spore: Spore, target: PositionTuple) -> Optional[Action]:
-        sx, sy = spore.position.x, spore.position.y
-        tx, ty = target
-        dx = 0 if tx == sx else (1 if tx > sx else -1)
-        dy = 0 if ty == sy else (1 if ty > sy else -1)
-
-        # Prefer x move first then y (deterministic)
-        if dx != 0:
-            return SporeMoveAction(sporeId=spore.id, direction=self._dir_pos(dx, 0))
-        if dy != 0:
-            return SporeMoveAction(sporeId=spore.id, direction=self._dir_pos(0, dy))
-        return None
-
-    # ---------- When to make more spawners ----------
-    def _should_create_spawner(
-        self,
-        team: TeamInfo,
-        tick: int,
-    ) -> bool:
-        # Spawners-built is a tie-breaker, but cost grows fast.
-        # We aggressively create spawners while cheap, then slow down.
+    # ----------------------------
+    # Economy knobs (victory conditions)
+    # territory first, then total resources, then spawners-built
+    # ----------------------------
+    @staticmethod
+    def _should_create_spawner(team: TeamInfo, tick: int) -> bool:
+        # Build early when cheap; stop when cost explodes.
         if team.nextSpawnerCost <= 7:
             return True
         if tick < 200 and team.nextSpawnerCost <= 15:
             return True
         return False
 
-    # ---------- Produce lots of small claim spores ----------
     def _produce_spores(self, actions: List[Action], team: TeamInfo):
-        # Territory-first: many biomass=2 spores (can move once to claim a tile).
-        # Keep some medium spores for repeated ring-fill and bridging between hubs.
-        # We also want many actions (tie-break), but without heavy computations.
+        # Many small spores = more territory markers and more actions over the game.
+        # biomass=2 can move and then becomes a marker (1) on a new tile.
+        claimer_biomass = 2
+        worker_biomass = 6  # occasional spore that can keep moving more
 
-        # Target counts scale slowly with nutrients
         nutrients = team.nutrients
         desired_spores = 6 + min(18, nutrients // 30)  # 6..24
+
         if len(team.spores) >= desired_spores:
             return
 
-        # Prefer cheap claimers
-        claimer_bio = 2
-        worker_bio = 6
-
-        # Produce at most one per spawner per tick
         for spawner in team.spawners:
             if len(team.spores) >= desired_spores:
                 break
 
-            # Alternate: one worker occasionally
             want_worker = (len(team.spores) % 7 == 0)
+            bio = worker_biomass if want_worker else claimer_biomass
 
-            bio = worker_bio if want_worker else claimer_bio
             if team.nutrients < bio:
                 continue
 
             actions.append(SpawnerProduceSporeAction(spawnerId=spawner.id, biomass=bio))
-            team.nutrients -= bio  # local bookkeeping
-            team.spores.append(Spore(id="__virtual__", teamId=team.teamId, position=spawner.position, biomass=bio))  # virtual for loop limit only
+            team.nutrients -= bio  # local budget
 
-        # Remove virtual spores (only used to cap production in this tick)
-        team.spores = [s for s in team.spores if s.id != "__virtual__"]
-
-    # ---------- Main ----------
+    # ----------------------------
+    # Main decision
+    # ----------------------------
     def get_next_move(self, game_message: TeamGameState) -> List[Action]:
         actions: List[Action] = []
+
         world = game_message.world
         my_id = game_message.yourTeamId
         my_team: TeamInfo = world.teamInfos[my_id]
         tick = game_message.tick
 
-        # Safety: no units
+        # 0) No units -> nothing to do
         if len(my_team.spores) == 0 and len(my_team.spawners) == 0:
             return actions
 
-        # 1) Avoid elimination: ensure at least 1 spawner if possible
+        # 1) Avoid elimination: ensure at least 1 spawner
         if len(my_team.spawners) == 0:
             if len(my_team.spores) > 0:
-                # Make a spawner ASAP (tiebreak spawners-built too)
-                actions.append(SporeCreateSpawnerAction(sporeId=my_team.spores[0].id))
+                s = my_team.spores[0]
+                p = (s.position.x, s.position.y)
+
+                # IMPORTANT FIX: do not create if a spawner already exists there
+                if not self._has_spawner_at(world, p):
+                    actions.append(SporeCreateSpawnerAction(sporeId=s.id))
             return actions
 
-        # 2) Produce many small spores for territory control
-        # (also increases actions executed later)
+        # 2) Produce spores (territory-first)
         self._produce_spores(actions, my_team)
 
-        # 3) Clean dead plans / free hubs
+        # 3) Cleanup plans for dead spores
         live_ids = {s.id for s in my_team.spores}
         for sid in list(self.plans.keys()):
             if sid not in live_ids:
-                old = self.plans[sid].hub
-                if old is not None and self.reserved_hubs.get(old) == sid:
-                    del self.reserved_hubs[old]
+                old_hub = self.plans[sid].hub
+                if old_hub is not None and self.reserved_hubs.get(old_hub) == sid:
+                    del self.reserved_hubs[old_hub]
                 del self.plans[sid]
 
-        # 4) Ensure each spore has a hub + plan
-        # Ring radius grows later to maximize territory by tick 1000
-        default_ring_max = 4 if tick < 200 else (6 if tick < 600 else 8)
+        # 4) Assign plans / hubs
+        ring_max = 4 if tick < 200 else (6 if tick < 600 else 8)
 
         for sp in my_team.spores:
             if sp.id not in self.plans:
-                self.plans[sp.id] = SporePlan(ring_max=default_ring_max)
+                self.plans[sp.id] = SporePlan(ring_max=ring_max)
+
             plan = self.plans[sp.id]
-            plan.ring_max = default_ring_max
+            plan.ring_max = ring_max
 
             if plan.hub is None or (plan.hub in self.reserved_hubs and self.reserved_hubs[plan.hub] != sp.id):
-                hub = self._pick_hub_reachable(world, my_id, start=(sp.position.x, sp.position.y), max_cost=45)
+                hub = self._pick_best_hub(world, my_id)
                 if hub is not None:
                     plan.hub = hub
                     plan.mode = "SEEK"
                     plan.ring_r = 1
                     plan.ring_i = 0
-                    plan.last_target = None
                     self.reserved_hubs[hub] = sp.id
 
-        # 5) Create more spawners while cheap (spawners-built tie-break)
-        # Convert a spore that is standing on a good nutrient tile (prefer hub tile).
-        if self._should_create_spawner(my_team, tick) and len(my_team.spores) > 0:
-            made = False
+        # 5) Create more spawners while cheap (tie-break: spawners built)
+        if self._should_create_spawner(my_team, tick):
             for sp in my_team.spores:
                 if sp.biomass < max(2, my_team.nextSpawnerCost + 1):
                     continue
-                p = (sp.position.x, sp.position.y)
-                # Prefer converting on high nutrient (helps resources tie-break too)
-                if self._nut(world, p) >= 50 or (self.plans.get(sp.id) and self.plans[sp.id].hub == p):
-                    actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
-                    made = True
-                    break
-            if made:
-                # Don't overload this tick; movement still handled for other spores below.
-                pass
 
-        # Track which spores already acted (create spawner uses spore action)
+                p = (sp.position.x, sp.position.y)
+                plan = self.plans.get(sp.id)
+
+                # Prefer: on its hub or on high nutrient
+                if (plan and plan.hub == p) or self._nut(world, p) >= 50:
+                    # IMPORTANT FIX: avoid spawner collision
+                    if not self._has_spawner_at(world, p):
+                        actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
+                    break
+
+        # Track spores that already used an action (create spawner uses spore action)
         used_spores = {a.sporeId for a in actions if hasattr(a, "sporeId")}
 
-        # 6) Movement: maximize territory (always try to move if biomass>=2)
-        # - SEEK: go to hub
-        # - RING: fill ring (takes all tiles around hub)
-        # - After ring done: pick next hub and repeat (expands to next high nutrient)
+        # 6) Move spores: SEEK hub -> RING fill -> new hub
         for sp in my_team.spores:
             if sp.id in used_spores:
                 continue
 
-            # Needs 2+ biomass to act
+            # Needs 2+ biomass to act (move/combat)
             if sp.biomass < 2:
                 continue
 
             plan = self.plans.get(sp.id)
-            if plan is None or plan.hub is None:
+            if not plan or plan.hub is None:
                 continue
 
             sp_pos = (sp.position.x, sp.position.y)
 
             if plan.mode == "SEEK":
                 if sp_pos != plan.hub:
-                    # Use server pathfinding for speed + simplicity
-                    actions.append(SporeMoveToAction(sporeId=sp.id, position=Position(x=plan.hub[0], y=plan.hub[1])))
+                    actions.append(
+                        SporeMoveToAction(
+                            sporeId=sp.id,
+                            position=Position(x=plan.hub[0], y=plan.hub[1]),
+                        )
+                    )
                     continue
                 plan.mode = "RING"
                 plan.ring_r = 1
                 plan.ring_i = 0
-                plan.last_target = None
 
             if plan.mode == "RING":
                 target = self._next_ring_target(world, my_id, plan)
                 if target is None:
-                    # Free hub and choose another top nutrient to keep expanding territory
+                    # finished ring: pick next hub and repeat
                     if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                         del self.reserved_hubs[plan.hub]
-                    plan.hub = self._pick_hub_reachable(world, my_id, start=sp_pos, max_cost=55)
-                    if plan.hub is not None:
-                        self.reserved_hubs[plan.hub] = sp.id
+
+                    new_hub = self._pick_best_hub(world, my_id)
+                    if new_hub is not None:
+                        plan.hub = new_hub
+                        self.reserved_hubs[new_hub] = sp.id
                         plan.mode = "SEEK"
                         plan.ring_r = 1
                         plan.ring_i = 0
-                        plan.last_target = None
                     continue
 
-                # If we're already there, try to move to next ring tile (for actions tie-break + territory)
-                if sp_pos == target:
-                    # move to next ring target if possible
-                    plan.last_target = None
-                    target2 = self._next_ring_target(world, my_id, plan)
-                    if target2 is None:
-                        continue
-                    target = target2
-
-                # Use server pathing; it should take cheapest path.
-                actions.append(SporeMoveToAction(sporeId=sp.id, position=Position(x=target[0], y=target[1])))
-
-        # 7) If no movement actions were possible, at least "do something" with any active spore
-        # (actions-executed tie-break) by nudging them deterministically.
-        if len(actions) == 0 and len(my_team.spores) > 0:
-            for sp in my_team.spores:
-                if sp.biomass >= 2:
-                    # move right if possible, else down
-                    x, y = sp.position.x, sp.position.y
-                    if x + 1 < world.map.width:
-                        actions.append(SporeMoveAction(sporeId=sp.id, direction=Position(x=1, y=0)))
-                    elif y + 1 < world.map.height:
-                        actions.append(SporeMoveAction(sporeId=sp.id, direction=Position(x=0, y=1)))
-                    break
+                actions.append(
+                    SporeMoveToAction(
+                        sporeId=sp.id,
+                        position=Position(x=target[0], y=target[1]),
+                    )
+                )
 
         return actions
 
