@@ -4,3 +4,4 @@ csharp/GameMessage.cs
 python/game_message.py
 python/venv
 csharp/bin/
+__pycache__/
