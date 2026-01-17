@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, TypeAlias
 
@@ -15,18 +16,12 @@ DIRS: list[PositionTuple] = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # U, D, L, R
 # TWEAKABLE CONSTANTS
 # ============================================================
 
-# Aggression timing
 AGGRO_TICK = 120
-
-# Avoid neutrals (strong)
-AVOID_NEUTRALS = True
-NEUTRAL_HARD_AVOID_ALWAYS = True
-NEUTRAL_HARD_AVOID_BEFORE = 1000  # used only if ALWAYS=Falsed
 
 # Hub scoring
 OWNED_BY_ME_PENALTY = 35
 ENEMY_OWNED_BONUS = 180
-NEUTRAL_OWNED_BONUS = 0  # set to 0 since we want to avoid neutrals
+NEUTRAL_OWNED_BONUS = 25
 HUB_NUTRIENT_MIN = 1
 
 # Spawner hunting
@@ -59,7 +54,13 @@ DESIRED_SPORES_PER_NUTRIENTS = 20
 # Combat safety margins
 ENEMY_MARGIN_BEFORE_AGGRO = 1
 ENEMY_MARGIN_AFTER_AGGRO = 0
-NEUTRAL_MARGIN = 2  # stronger avoid neutrals (need clearly bigger to enter)
+NEUTRAL_MARGIN = 1
+
+# Neutral avoidance behavior
+NEUTRAL_AS_WALL = True                 # treat neutral tiles as walls (pathfinding)
+BREAK_NEUTRAL_IF_STUCK = True          # only break neutrals if no non-neutral move exists
+STUCK_SEARCH_RADIUS = 8                # local scan to decide "stuck"
+BFS_MAX_EXPANSIONS = 3000              # safety for BFS cost
 
 
 # ============================================================
@@ -77,20 +78,9 @@ class SporePlan:
 
 class Bot:
     def __init__(self):
-        print("Bot: territory + attack + spawners, avoid neutrals, greedy move")
+        print("Bot: territory-first + aggressive, avoid neutrals (break only if stuck)")
         self.plans: Dict[str, SporePlan] = {}
         self.reserved_hubs: Dict[PositionTuple, str] = {}  # hub -> sporeId
-
-    # ----------------------------
-    # Neutral avoidance switch
-    # ----------------------------
-    @staticmethod
-    def _avoid_neutral_now(tick: int) -> bool:
-        if not AVOID_NEUTRALS:
-            return False
-        if NEUTRAL_HARD_AVOID_ALWAYS:
-            return True
-        return tick < NEUTRAL_HARD_AVOID_BEFORE
 
     # ----------------------------
     # Helpers map / grids (grid[y][x])
@@ -130,7 +120,7 @@ class Bot:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     @staticmethod
-    def _dir_to_pos(from_p: PositionTuple, to_p: PositionTuple) -> Position:
+    def _dir_to(from_p: PositionTuple, to_p: PositionTuple) -> Position:
         return Position(x=to_p[0] - from_p[0], y=to_p[1] - from_p[1])
 
     # ----------------------------
@@ -176,14 +166,152 @@ class Bot:
         return True
 
     # ----------------------------
-    # Enemy spawner positions
+    # Neutral logic
+    # ----------------------------
+    def _is_neutral_tile(self, world: GameWorld, neutral_id: str, p: PositionTuple) -> bool:
+        return self._tile_owner(world, p) == neutral_id
+
+    def _is_wall_tile(self, world: GameWorld, neutral_id: str, p: PositionTuple, allow_break: bool) -> bool:
+        # If neutrals are walls, they are walls unless we explicitly allow breaking them.
+        if NEUTRAL_AS_WALL and self._is_neutral_tile(world, neutral_id, p):
+            return not allow_break
+        return False
+
+    # ----------------------------
+    # "Stuck" detection: are there ANY reachable non-neutral tiles nearby?
+    # We use a small BFS radius; if none found, we allow neutral breaking.
+    # ----------------------------
+    def _should_allow_break_neutral(
+        self,
+        world: GameWorld,
+        my_id: str,
+        neutral_id: str,
+        tick: int,
+        spore: Spore,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+    ) -> bool:
+        if not BREAK_NEUTRAL_IF_STUCK:
+            return False
+
+        start = (spore.position.x, spore.position.y)
+
+        q = deque([(start, 0)])
+        seen = {start}
+
+        while q:
+            cur, d = q.popleft()
+            if d > STUCK_SEARCH_RADIUS:
+                continue
+
+            # Found a non-neutral tile that we can enter -> not stuck
+            if cur != start and not self._is_neutral_tile(world, neutral_id, cur):
+                if self._safe_to_enter(cur, spore.biomass, tick, enemy_strength, neutral_strength):
+                    return False
+
+            for dx, dy in DIRS:
+                nb = (cur[0] + dx, cur[1] + dy)
+                if not self._in_bounds(world, nb[0], nb[1]):
+                    continue
+                if nb in seen:
+                    continue
+
+                # When checking "stuck", treat neutrals as walls (we're checking escape without breaking)
+                if self._is_wall_tile(world, neutral_id, nb, allow_break=False):
+                    continue
+
+                if not self._safe_to_enter(nb, spore.biomass, tick, enemy_strength, neutral_strength):
+                    continue
+
+                seen.add(nb)
+                q.append((nb, d + 1))
+
+        # No reachable non-neutral tile in radius -> allow breaking neutrals
+        return True
+
+    # ----------------------------
+    # BFS next-step to a goal, neutrals treated as walls unless allow_break_neutral=True
+    # returns next tile to step onto, or None if unreachable
+    # ----------------------------
+    def _bfs_next_step(
+        self,
+        world: GameWorld,
+        my_id: str,
+        neutral_id: str,
+        tick: int,
+        spore: Spore,
+        goal: PositionTuple,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+        allow_break_neutral: bool,
+    ) -> Optional[PositionTuple]:
+        start = (spore.position.x, spore.position.y)
+        if start == goal:
+            return None
+
+        # If goal is neutral and we are not allowed to break, unreachable by design
+        if self._is_wall_tile(world, neutral_id, goal, allow_break=allow_break_neutral):
+            return None
+
+        q = deque([start])
+        prev: Dict[PositionTuple, Optional[PositionTuple]] = {start: None}
+
+        expansions = 0
+
+        while q:
+            cur = q.popleft()
+            if cur == goal:
+                break
+
+            expansions += 1
+            if expansions > BFS_MAX_EXPANSIONS:
+                break
+
+            for dx, dy in DIRS:
+                nb = (cur[0] + dx, cur[1] + dy)
+                if not self._in_bounds(world, nb[0], nb[1]):
+                    continue
+                if nb in prev:
+                    continue
+
+                # walls (neutral unless allowed)
+                if self._is_wall_tile(world, neutral_id, nb, allow_break=allow_break_neutral):
+                    continue
+
+                # survivable entry for this spore
+                if not self._safe_to_enter(nb, spore.biomass, tick, enemy_strength, neutral_strength):
+                    continue
+
+                prev[nb] = cur
+                q.append(nb)
+
+        if goal not in prev:
+            return None
+
+        # Reconstruct one step
+        cur = goal
+        while prev[cur] is not None and prev[cur] != start:
+            cur = prev[cur]
+
+        if prev[cur] == start:
+            return cur
+        if prev[goal] == start:
+            return goal
+        return None
+
+    # ----------------------------
+    # Enemy spawners positions
     # ----------------------------
     @staticmethod
     def _enemy_spawner_positions(world: GameWorld, my_id: str) -> List[PositionTuple]:
-        return [(spw.position.x, spw.position.y) for spw in world.spawners if spw.teamId != my_id]
+        out: List[PositionTuple] = []
+        for spw in world.spawners:
+            if spw.teamId != my_id:
+                out.append((spw.position.x, spw.position.y))
+        return out
 
     # ----------------------------
-    # Hub selection (fast, aggressive, avoid neutrals)
+    # Hub selection (avoid neutrals by default)
     # ----------------------------
     def _pick_best_hub(
         self,
@@ -193,12 +321,9 @@ class Bot:
         tick: int,
         enemy_strength: Dict[PositionTuple, int],
         neutral_strength: Dict[PositionTuple, int],
-        ref_pos: Optional[PositionTuple] = None,
     ) -> Optional[PositionTuple]:
         best: Optional[PositionTuple] = None
-        best_score = -10**12
-
-        enemy_spawners = self._enemy_spawner_positions(world, my_id)
+        best_score = -10**9
 
         for y in range(world.map.height):
             row = world.map.nutrientGrid[y]
@@ -214,11 +339,11 @@ class Bot:
 
                 owner = self._tile_owner(world, p)
 
-                # HARD AVOID neutral hubs if enabled
-                if self._avoid_neutral_now(tick) and owner == neutral_id:
+                # Avoid choosing neutrals as hubs (unless later we decide we're stuck)
+                if NEUTRAL_AS_WALL and owner == neutral_id:
                     continue
 
-                score = v * 3
+                score = v
 
                 if owner == my_id and self._tile_biomass(world, p) >= 1:
                     score -= OWNED_BY_ME_PENALTY
@@ -226,26 +351,10 @@ class Bot:
                 if tick >= AGGRO_TICK and owner not in (my_id, neutral_id):
                     score += ENEMY_OWNED_BONUS
 
-                # spawner hunting
-                if tick <= CHASE_SPAWNER_BEFORE_TICK and enemy_spawners:
-                    dmin = 10**9
-                    for spw_pos in enemy_spawners:
-                        d = self._manhattan(p, spw_pos)
-                        if d < dmin:
-                            dmin = d
-                    if dmin == 0:
-                        score += SPAWNER_HUNT_BONUS
-                    elif dmin <= SPAWNER_HUNT_RADIUS:
-                        score += max(0, SPAWNER_HUNT_BONUS - dmin * 30)
+                if owner == neutral_id:
+                    score += NEUTRAL_OWNED_BONUS
 
-                if ref_pos is not None:
-                    score -= self._manhattan(ref_pos, p) * 2
-
-                # early: avoid extreme stacks
-                if enemy_strength.get(p, 0) >= 18 and tick < AGGRO_TICK:
-                    continue
-                # also avoid neutral stacks as hubs (if not already avoided)
-                if neutral_strength.get(p, 0) > 0 and self._avoid_neutral_now(tick):
+                if enemy_strength.get(p, 0) >= 15 and tick < AGGRO_TICK:
                     continue
 
                 if score > best_score:
@@ -255,7 +364,7 @@ class Bot:
         return best
 
     # ----------------------------
-    # Ring fill (square rings)
+    # Ring positions / target
     # ----------------------------
     def _ring_positions(self, world: GameWorld, hub: PositionTuple, r: int) -> List[PositionTuple]:
         hx, hy = hub
@@ -292,6 +401,7 @@ class Bot:
         plan: SporePlan,
         enemy_strength: Dict[PositionTuple, int],
         neutral_strength: Dict[PositionTuple, int],
+        allow_break_neutral: bool,
     ) -> Optional[PositionTuple]:
         if plan.hub is None:
             return None
@@ -311,8 +421,8 @@ class Bot:
                 if self._owned_by_me(world, my_id, p):
                     continue
 
-                # HARD AVOID neutral tiles (do not even target)
-                if self._avoid_neutral_now(tick) and self._tile_owner(world, p) == neutral_id:
+                # Avoid neutrals unless we decided we are stuck
+                if self._is_wall_tile(world, neutral_id, p, allow_break=allow_break_neutral):
                     continue
 
                 if not self._safe_to_enter(p, spore_biomass, tick, enemy_strength, neutral_strength):
@@ -327,69 +437,7 @@ class Bot:
         return None
 
     # ----------------------------
-    # Greedy step selection (avoid neutral traversal, opportunistic fights)
-    # ----------------------------
-    def _choose_one_step(
-        self,
-        world: GameWorld,
-        my_id: str,
-        neutral_id: str,
-        tick: int,
-        spore: Spore,
-        target: PositionTuple,
-        enemy_strength: Dict[PositionTuple, int],
-        neutral_strength: Dict[PositionTuple, int],
-    ) -> Optional[PositionTuple]:
-        start = (spore.position.x, spore.position.y)
-        best = None
-        best_score = -10**18
-
-        for dx, dy in DIRS:
-            nb = (start[0] + dx, start[1] + dy)
-            if not self._in_bounds(world, nb[0], nb[1]):
-                continue
-
-            owner = self._tile_owner(world, nb)
-
-            # HARD avoid neutrals (do not enter neutral tiles at all)
-            if self._avoid_neutral_now(tick) and owner == neutral_id:
-                continue
-
-            # must be survivable
-            if not self._safe_to_enter(nb, spore.biomass, tick, enemy_strength, neutral_strength):
-                continue
-
-            # scoring
-            dist_before = self._manhattan(start, target)
-            dist_after = self._manhattan(nb, target)
-            closer = dist_before - dist_after
-
-            nutrient = self._nut(world, nb)
-            steal_enemy = 1 if (owner not in (my_id, neutral_id) and owner != "") else 0
-            claim_new = 1 if not self._owned_by_me(world, my_id, nb) else 0
-
-            # If enemy spore there and we win => big bonus
-            e = enemy_strength.get(nb, 0)
-            attack_bonus = 0
-            if e > 0 and spore.biomass > e:
-                attack_bonus = 600 + (spore.biomass - e) * 5
-
-            score = (
-                closer * 60
-                + nutrient * 2
-                + steal_enemy * 200
-                + claim_new * 80
-                + attack_bonus
-            )
-
-            if score > best_score:
-                best_score = score
-                best = nb
-
-        return best
-
-    # ----------------------------
-    # Economy knobs
+    # Economy
     # ----------------------------
     @staticmethod
     def _should_create_spawner(team: TeamInfo, tick: int) -> bool:
@@ -467,7 +515,7 @@ class Bot:
                     del self.reserved_hubs[old_hub]
                 del self.plans[sid]
 
-        # 4) Assign hubs / plans
+        # 4) Assign plans / hubs
         ring_max = RING_MAX_EARLY if tick < 200 else (RING_MAX_MID if tick < 600 else RING_MAX_LATE)
 
         for sp in my_team.spores:
@@ -477,22 +525,12 @@ class Bot:
             plan = self.plans[sp.id]
             plan.ring_max = ring_max
 
-            sp_pos = (sp.position.x, sp.position.y)
-
             hub_invalid = (
                 plan.hub is None
                 or (plan.hub in self.reserved_hubs and self.reserved_hubs[plan.hub] != sp.id)
             )
             if hub_invalid:
-                hub = self._pick_best_hub(
-                    world=world,
-                    my_id=my_id,
-                    neutral_id=neutral_id,
-                    tick=tick,
-                    enemy_strength=enemy_strength,
-                    neutral_strength=neutral_strength,
-                    ref_pos=sp_pos,
-                )
+                hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
                 if hub is not None:
                     plan.hub = hub
                     plan.mode = "SEEK"
@@ -500,29 +538,23 @@ class Bot:
                     plan.ring_i = 0
                     self.reserved_hubs[hub] = sp.id
 
-        # 5) Create spawners while cheap, on good soil (avoid collisions)
+        # 5) Create spawners while cheap (avoid duplicates)
         if self._should_create_spawner(my_team, tick):
             for sp in my_team.spores:
                 if sp.biomass < max(2, my_team.nextSpawnerCost + 1):
                     continue
 
                 p = (sp.position.x, sp.position.y)
-                if self._has_spawner_at(world, p):
-                    continue
+                plan = self.plans.get(sp.id)
 
-                owner = self._tile_owner(world, p)
-
-                # avoid creating on neutral tiles if we're in avoid-neutral mode
-                if self._avoid_neutral_now(tick) and owner == neutral_id:
-                    continue
-
-                if self._nut(world, p) >= NUTRIENT_FOR_SPAWNER or (tick >= AGGRO_TICK and owner not in (my_id, neutral_id)):
-                    actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
+                if (plan and plan.hub == p) or self._nut(world, p) >= NUTRIENT_FOR_SPAWNER:
+                    if not self._has_spawner_at(world, p):
+                        actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
                     break
 
         used_spores = {a.sporeId for a in actions if hasattr(a, "sporeId")}
 
-        # 6) Movement: attack / steal / expand, avoid neutrals, greedy steps
+        # 6) Movement: BFS stepping with "neutrals as walls" unless stuck
         enemy_spawners = self._enemy_spawner_positions(world, my_id)
 
         for sp in my_team.spores:
@@ -532,29 +564,22 @@ class Bot:
                 continue
 
             plan = self.plans.get(sp.id)
-            if not plan:
+            if not plan or plan.hub is None:
                 continue
 
             sp_pos = (sp.position.x, sp.position.y)
 
-            # A) Adjacent enemy spawner: step onto it if safe (pressure)
-            moved = False
-            if enemy_spawners and tick <= CHASE_SPAWNER_BEFORE_TICK:
-                for dx, dy in DIRS:
-                    nb = (sp_pos[0] + dx, sp_pos[1] + dy)
-                    if not self._in_bounds(world, nb[0], nb[1]):
-                        continue
-                    if nb in enemy_spawners:
-                        if self._avoid_neutral_now(tick) and self._tile_owner(world, nb) == neutral_id:
-                            continue
-                        if self._safe_to_enter(nb, sp.biomass, tick, enemy_strength, neutral_strength):
-                            actions.append(SporeMoveAction(sporeId=sp.id, direction=Position(x=dx, y=dy)))
-                            moved = True
-                            break
-            if moved:
-                continue
+            allow_break = self._should_allow_break_neutral(
+                world=world,
+                my_id=my_id,
+                neutral_id=neutral_id,
+                tick=tick,
+                spore=sp,
+                enemy_strength=enemy_strength,
+                neutral_strength=neutral_strength,
+            )
 
-            # B) If enemy spawner nearby, chase it with greedy steps (avoid neutral traversal)
+            # A) If chasing enemy spawner is possible without breaking neutrals, do it
             if enemy_spawners and tick <= CHASE_SPAWNER_BEFORE_TICK:
                 nearest = None
                 dmin = 10**9
@@ -563,37 +588,28 @@ class Bot:
                     if d < dmin:
                         dmin = d
                         nearest = ep
+
                 if nearest is not None and dmin <= SPAWNER_HUNT_RADIUS:
-                    step = self._choose_one_step(
+                    step = self._bfs_next_step(
                         world=world,
                         my_id=my_id,
                         neutral_id=neutral_id,
                         tick=tick,
                         spore=sp,
-                        target=nearest,
+                        goal=nearest,
                         enemy_strength=enemy_strength,
                         neutral_strength=neutral_strength,
+                        allow_break_neutral=allow_break,
                     )
                     if step is not None:
-                        actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to_pos(sp_pos, step)))
+                        actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step)))
                         continue
 
-            # C) Normal plan: SEEK hub -> RING (greedy steps)
-            if plan.hub is None:
-                hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength, ref_pos=sp_pos)
-                if hub is None:
-                    continue
-                plan.hub = hub
-                self.reserved_hubs[hub] = sp.id
-                plan.mode = "SEEK"
-                plan.ring_r = 1
-                plan.ring_i = 0
-
-            # If hub is unsafe for this spore, repick
+            # B) Normal plan: SEEK hub -> RING
             if not self._safe_to_enter(plan.hub, sp.biomass, tick, enemy_strength, neutral_strength):
                 if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                     del self.reserved_hubs[plan.hub]
-                new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength, ref_pos=sp_pos)
+                new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
                 if new_hub is not None:
                     plan.hub = new_hub
                     self.reserved_hubs[new_hub] = sp.id
@@ -601,12 +617,44 @@ class Bot:
                     plan.ring_r = 1
                     plan.ring_i = 0
 
+            if plan.hub is None:
+                continue
+
             if plan.mode == "SEEK":
                 if sp_pos != plan.hub:
-                    step = self._choose_one_step(world, my_id, neutral_id, tick, sp, plan.hub, enemy_strength, neutral_strength)
+                    step = self._bfs_next_step(
+                        world=world,
+                        my_id=my_id,
+                        neutral_id=neutral_id,
+                        tick=tick,
+                        spore=sp,
+                        goal=plan.hub,
+                        enemy_strength=enemy_strength,
+                        neutral_strength=neutral_strength,
+                        allow_break_neutral=allow_break,
+                    )
+
                     if step is None:
-                        continue
-                    actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to_pos(sp_pos, step)))
+                        # hub unreachable without breaking and we aren't stuck -> repick hub
+                        if not allow_break:
+                            if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
+                                del self.reserved_hubs[plan.hub]
+                            new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
+                            if new_hub is not None:
+                                plan.hub = new_hub
+                                self.reserved_hubs[new_hub] = sp.id
+                                plan.mode = "SEEK"
+                                plan.ring_r = 1
+                                plan.ring_i = 0
+                            continue
+
+                        # If stuck, allow breaking neutrals by stepping into best adjacent neutral
+                        step = self._pick_best_adjacent_neutral_step(world, my_id, neutral_id, tick, sp, enemy_strength, neutral_strength)
+                        if step is not None:
+                            actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step)))
+                            continue
+
+                    actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step)))
                     continue
 
                 plan.mode = "RING"
@@ -623,12 +671,14 @@ class Bot:
                     plan=plan,
                     enemy_strength=enemy_strength,
                     neutral_strength=neutral_strength,
+                    allow_break_neutral=allow_break,
                 )
 
                 if target is None:
                     if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                         del self.reserved_hubs[plan.hub]
-                    new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength, ref_pos=sp_pos)
+
+                    new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength)
                     if new_hub is not None:
                         plan.hub = new_hub
                         self.reserved_hubs[new_hub] = sp.id
@@ -637,12 +687,81 @@ class Bot:
                         plan.ring_i = 0
                     continue
 
-                step = self._choose_one_step(world, my_id, neutral_id, tick, sp, target, enemy_strength, neutral_strength)
+                step = self._bfs_next_step(
+                    world=world,
+                    my_id=my_id,
+                    neutral_id=neutral_id,
+                    tick=tick,
+                    spore=sp,
+                    goal=target,
+                    enemy_strength=enemy_strength,
+                    neutral_strength=neutral_strength,
+                    allow_break_neutral=allow_break,
+                )
+
                 if step is None:
+                    # unreachable ring tile: if not stuck, skip; if stuck, break neutral
+                    if allow_break:
+                        step2 = self._pick_best_adjacent_neutral_step(world, my_id, neutral_id, tick, sp, enemy_strength, neutral_strength)
+                        if step2 is not None:
+                            actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step2)))
+                    else:
+                        plan.ring_i = (plan.ring_i + 1) % max(1, len(self._ring_positions(world, plan.hub, plan.ring_r)))
                     continue
-                actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to_pos(sp_pos, step)))
+
+                actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step)))
 
         return actions
+
+    # ----------------------------
+    # If stuck, choose best adjacent neutral tile to break (only then).
+    # Prefers neutral tile that opens territory: highest nutrients + enemy proximity.
+    # ----------------------------
+    def _pick_best_adjacent_neutral_step(
+        self,
+        world: GameWorld,
+        my_id: str,
+        neutral_id: str,
+        tick: int,
+        spore: Spore,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+    ) -> Optional[PositionTuple]:
+        start = (spore.position.x, spore.position.y)
+        best = None
+        best_score = -10**12
+
+        for dx, dy in DIRS:
+            nb = (start[0] + dx, start[1] + dy)
+            if not self._in_bounds(world, nb[0], nb[1]):
+                continue
+            if not self._is_neutral_tile(world, neutral_id, nb):
+                continue
+            if not self._safe_to_enter(nb, spore.biomass, tick, enemy_strength, neutral_strength):
+                continue
+
+            # Score: nutrients + "opening potential" (count nearby non-neutral tiles)
+            score = self._nut(world, nb) * 3
+
+            open_tiles = 0
+            for ddx, ddy in DIRS:
+                nb2 = (nb[0] + ddx, nb[1] + ddy)
+                if not self._in_bounds(world, nb2[0], nb2[1]):
+                    continue
+                if not self._is_neutral_tile(world, neutral_id, nb2):
+                    open_tiles += 1
+            score += open_tiles * 40
+
+            # Bonus if stepping breaks toward enemy-owned areas after aggro
+            owner = self._tile_owner(world, nb)
+            if tick >= AGGRO_TICK and owner not in (my_id, neutral_id):
+                score += 100
+
+            if score > best_score:
+                best_score = score
+                best = nb
+
+        return best
 
 
 # -------------------------------------------------------------------
