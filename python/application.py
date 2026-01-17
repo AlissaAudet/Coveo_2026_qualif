@@ -5,7 +5,9 @@ import dataclasses
 import json
 import os
 import traceback
+from sys import stderr
 
+import msgspec
 from websockets.asyncio.client import connect, ClientConnection
 from websockets.exceptions import ConnectionClosed
 
@@ -39,11 +41,14 @@ async def game_loop(websocket: ClientConnection, bot: Bot):
             print("Websocket was closed.")
             break
 
-        game_message: TeamGameState = TeamGameState.from_json(message)
-        print(f"Playing tick {game_message.currentTickNumber}")
+        game_message: TeamGameState = msgspec.json.decode(message, type=TeamGameState)
 
         if game_message.lastTickErrors:
-            print(f"Errors during last tick : {game_message.lastTickErrors}")
+            print(
+                f"Errors during last tick : {game_message.lastTickErrors}", file=stderr
+            )
+
+        print(f"Playing tick {game_message.tick}")
 
         actions = []
 
@@ -56,13 +61,11 @@ async def game_loop(websocket: ClientConnection, bot: Bot):
 
         payload = {
             "type": "COMMAND",
-            "tick": game_message.currentTickNumber,
+            "tick": game_message.tick,
             "actions": [dataclasses.asdict(action) for action in actions],
         }
 
-        print(json.dumps(payload))
-
-        await websocket.send(json.dumps(payload))
+        await websocket.send(msgspec.json.encode(payload))
 
 
 if __name__ == "__main__":
