@@ -3,6 +3,12 @@ __pycache__/
 .idea
 .vscode
 
+<<<<<<< HEAD
+=======
+# Qualification binaries and large files
+qualification/
+
+>>>>>>> f2927ed6449898f74949d20c48a822734b2e8eaf
 #
 # Python
 ### Python ###
@@ -39,4 +45,8 @@ EGG-INFO
 .tox/
 tox/
 pip-log.txt
+<<<<<<< HEAD
 # ... (rest of the content for various tools/editors is long, can be found via the link below)
+=======
+# ... (rest of the content for various tools/editors is long, can be found via the link below)
+>>>>>>> f2927ed6449898f74949d20c48a822734b2e8eaf
