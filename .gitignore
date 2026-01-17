@@ -1,6 +1,43 @@
-typescript/GameInterface.ts
-java/src/main/java/codes/blitz/game/generated
-csharp/GameMessage.cs
-python/game_message.py
-python/venv
-csharp/bin/
+game_message.py
+venv
+__pycache__/
+.idea
+.vscode
+
+#
+# Python
+### Python ###
+# Byte-compiled / optimized / compressed files and directories.
+__pycache__/
+*.py[cod]
+*.mpy
+*.mpyc
+.mypy_cache/
+.pytest_cache/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / Packaging.
+.Python
+build/
+dist/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PKG-INFO
+EGG-INFO
+
+# Test and coverage output.
+.coverage
+.coverage.*
+.nox/
+.tox/
+tox/
+pip-log.txt
+# ... (rest of the content for various tools/editors is long, can be found via the link below)
