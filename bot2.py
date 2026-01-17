@@ -79,10 +79,10 @@ NUTRIENT_FOR_SPAWNER = 45
 CLAIMER_BIOMASS = 2
 # Biomass of a cheap "claimer" spore (mainly for expansion/claiming tiles).
 
-WORKER_BIOMASS = 2
+WORKER_BIOMASS = 15
 # Biomass of a "worker" spore (stronger than claimer, better for safer expansion or breaking through).
 
-FIGHTER_BIOMASS = 2
+FIGHTER_BIOMASS = 100
 # Biomass of a "fighter" spore (strong combat unit to win fights and pressure opponents).
 
 FIGHTER_EVERY_N = 6
@@ -109,7 +109,7 @@ ENEMY_MARGIN_BEFORE_AGGRO = 1
 ENEMY_MARGIN_AFTER_AGGRO = 0
 # After AGGRO_TICK, allow more even fights (lower margin makes the bot more aggressive).
 
-NEUTRAL_MARGIN = 0
+NEUTRAL_MARGIN = 1
 # Margin required to enter a tile occupied by a neutral spore (avoids losing to neutrals unless stronger).
 
 # ----------------------------
@@ -121,7 +121,7 @@ NEUTRAL_AS_WALL = False
 BREAK_NEUTRAL_IF_STUCK = True
 # If True, we allow stepping into neutral tiles only when a local search finds no reachable non-neutral escape route.
 
-STUCK_SEARCH_RADIUS = 15
+STUCK_SEARCH_RADIUS = 10
 # Radius (in BFS steps) used to decide whether a spore is "stuck" behind neutral walls.
 
 BFS_MAX_EXPANSIONS = 3000
@@ -762,19 +762,23 @@ class Bot:
                     enemy_strength=enemy_strength,
                     neutral_strength=neutral_strength,
                     allow_break_neutral=allow_break,
-                )
+                            )
+            if step is None:
+                if allow_break:
+                    step2 = self._pick_best_adjacent_neutral_step(
+                        world, my_id, neutral_id, tick, sp, enemy_strength, neutral_strength
+                    )
 
-                if step is None:
-                    # unreachable ring tile: if not stuck, skip; if stuck, break neutral
-                    if allow_break:
-                        step2 = self._pick_best_adjacent_neutral_step(world, my_id, neutral_id, tick, sp, enemy_strength, neutral_strength)
-                        if step2 is not None:
-                            actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step2)))
-                    else:
-                        plan.ring_i = (plan.ring_i + 1) % max(1, len(self._ring_positions(world, plan.hub, plan.ring_r)))
+                    if step2 is None:
+                        step2 = self._pick_adjacent_neutral_spore_break_step(
+                            world, neutral_id, sp, neutral_strength
+                        )
+
+                    if step2 is not None:
+                        actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step2)))
+
                     continue
 
-                actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to(sp_pos, step)))
 
         return actions
 
@@ -827,6 +831,37 @@ class Bot:
                 best = nb
 
         return best
+
+def _pick_adjacent_neutral_spore_break_step(
+    self,
+    world: GameWorld,
+    neutral_id: str,
+    spore: Spore,
+    neutral_strength: Dict[PositionTuple, int],
+) -> Optional[PositionTuple]:
+    start = (spore.position.x, spore.position.y)
+    best = None
+    best_n = 10**9
+
+    for dx, dy in DIRS:
+        nb = (start[0] + dx, start[1] + dy)
+        if not self._in_bounds(world, nb[0], nb[1]):
+            continue
+
+        # must be a neutral-owned tile
+        if not self._is_neutral_tile(world, neutral_id, nb):
+            continue
+
+        n = neutral_strength.get(nb, 0)
+        if n <= 0:
+            continue  # not blocked by a neutral spore
+
+        # RELAXED break rule: if we are strictly stronger, allow it (ignore NEUTRAL_MARGIN)
+        if spore.biomass > n and n < best_n:
+            best_n = n
+            best = nb
+
+    return best
 
 
 # -------------------------------------------------------------------

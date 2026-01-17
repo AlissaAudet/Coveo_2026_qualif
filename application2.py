@@ -11,7 +11,7 @@ import msgspec
 from websockets.asyncio.client import connect, ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from bot import Bot
+from bot2 import Bot
 from game_message import TeamGameState
 
 
@@ -26,7 +26,7 @@ async def run():
             )
         else:
             await websocket.send(
-                json.dumps({"type": "REGISTER", "teamName": "Original"})
+                json.dumps({"type": "REGISTER", "teamName": "New Bot"})
             )
 
         await game_loop(websocket=websocket, bot=bot)
