@@ -11,6 +11,7 @@ class Bot:
         Here is where the magic happens, for now the moves are not very good. I bet you can do better ;)
         """
         actions = []
+        print("Info Map World\n", game_message.world, "\n")
 
         my_team: TeamInfo = game_message.world.teamInfos[game_message.yourTeamId]
         if len(my_team.spawners) == 0:
