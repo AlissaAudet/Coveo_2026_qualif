@@ -16,49 +16,66 @@ DIRS: list[PositionTuple] = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # U, D, L, R
 # TWEAKABLE CONSTANTS (MORE AGGRESSIVE)
 # ============================================================
 
-# Become aggressive earlier
-AGGRO_TICK = 120
+# Aggression timing
+AGGRO_TICK = 80
+CHASE_SPAWNER_BEFORE_TICK = 950
 
 # Hub scoring
-OWNED_BY_ME_PENALTY = 35
-ENEMY_OWNED_BONUS = 180          # stronger pull onto enemy territory
-NEUTRAL_OWNED_BONUS = 25
 HUB_NUTRIENT_MIN = 1
+OWNED_BY_ME_PENALTY = 60
 
-# New: spawner hunting
-SPAWNER_HUNT_BONUS = 800         # huge incentive to target enemy spawners
-SPAWNER_HUNT_RADIUS = 30         # only consider spawners within this manhattan distance
-CHASE_SPAWNER_BEFORE_TICK = 900  # still chase late game
+# Prefer enemy tiles for hubs (territory stealing)
+ENEMY_OWNED_BONUS = 260
 
-# Ring behavior (area to fill around hub)
+# Avoid neutral tiles (ownership == neutralTeamId) unless we choose to farm them
+NEUTRAL_OWNED_PENALTY = 120
+NEUTRAL_HARD_AVOID_BEFORE = 450  # early/mid: avoid neutral
+
+# Spawner hunting
+SPAWNER_HUNT_BONUS = 1100
+SPAWNER_HUNT_RADIUS = 35
+
+# Ring behavior
 RING_MAX_EARLY = 4
-RING_MAX_MID = 7
-RING_MAX_LATE = 10
+RING_MAX_MID = 8
+RING_MAX_LATE = 12
 
-# Spawner creation
+# Spawner creation (still important, but not at the expense of attack/territory)
 SPAWNER_COST_ALWAYS_OK_UNTIL = 7
 SPAWNER_COST_OK_EARLY_UNTIL = 15
 SPAWNER_EARLY_TICK = 220
-NUTRIENT_FOR_SPAWNER = 45
+NUTRIENT_FOR_SPAWNER = 55
+MAX_SPAWNERS_SOFT = 6  # don't spam spawners endlessly
 
-# Spore production (more units + some fighters)
+# Spore production (more fighters to contest)
 CLAIMER_BIOMASS = 2
 WORKER_BIOMASS = 6
 FIGHTER_BIOMASS = 12
-FIGHTER_EVERY_N = 6
+FIGHTER_EVERY_N = 4
 WORKER_EVERY_N = 9
 
-DESIRED_SPORES_BASE = 10
-DESIRED_SPORES_MAX_EXTRA = 30
-DESIRED_SPORES_PER_NUTRIENTS = 20
+DESIRED_SPORES_BASE = 12
+DESIRED_SPORES_MAX_EXTRA = 28
+DESIRED_SPORES_PER_NUTRIENTS = 18
 
-# Combat safety margins:
-# You only need to be strictly stronger to win (deterministic).
-# Setting margin to 0 makes the bot commit more fights.
+# Combat safety margins
 ENEMY_MARGIN_BEFORE_AGGRO = 1
 ENEMY_MARGIN_AFTER_AGGRO = 0
-NEUTRAL_MARGIN = 1
+NEUTRAL_MARGIN = 2  # more cautious vs neutral (avoid getting stuck)
 
+# Attack/recapture steering
+ATTACKERS_MIN = 2
+ATTACKERS_DIV = 4  # ~25% attackers
+FRONTLINE_RADIUS_FROM_SPAWNERS = 24
+ENEMY_TILE_FRONTLINE_BONUS = 180
+
+# Movement scoring (one-step "greedy" to force recapture)
+STEP_CLOSER_WEIGHT = 55
+STEP_NUTRIENT_WEIGHT = 2
+STEP_STEAL_BONUS = 220
+STEP_ENEMY_TILE_BONUS = 260
+STEP_NEUTRAL_TILE_PENALTY = 200
+STEP_FREE_TRACE_BONUS = 18
 
 # ============================================================
 # Strategy state per spore
@@ -71,16 +88,17 @@ class SporePlan:
     ring_i: int = 0
     ring_max: int = RING_MAX_EARLY
     last_target: Optional[PositionTuple] = None
+    role: str = "EXPAND"  # EXPAND / ATTACK / DEFEND
 
 
 class Bot:
     def __init__(self):
-        print("Bot: aggressive territory + spawner hunting + earlier aggro")
+        print("Bot: territory+attack first, spawner hunting, avoid neutrals early")
         self.plans: Dict[str, SporePlan] = {}
-        self.reserved_hubs: Dict[PositionTuple, str] = {}  # hub -> sporeId
+        self.reserved_hubs: Dict[PositionTuple, str] = {}
 
     # ----------------------------
-    # Helpers map / grids (grid[y][x])
+    # Helpers (grid[y][x])
     # ----------------------------
     @staticmethod
     def _in_bounds(world: GameWorld, x: int, y: int) -> bool:
@@ -115,6 +133,31 @@ class Bot:
     @staticmethod
     def _manhattan(a: PositionTuple, b: PositionTuple) -> int:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def _neighbors(self, world: GameWorld, p: PositionTuple) -> List[PositionTuple]:
+        x, y = p
+        out: List[PositionTuple] = []
+        for dx, dy in DIRS:
+            nx, ny = x + dx, y + dy
+            if self._in_bounds(world, nx, ny):
+                out.append((nx, ny))
+        return out
+
+    @staticmethod
+    def _dir_to_pos(from_p: PositionTuple, to_p: PositionTuple) -> Position:
+        return Position(x=to_p[0] - from_p[0], y=to_p[1] - from_p[1])
+
+    @staticmethod
+    def _my_spawner_positions(team: TeamInfo) -> List[PositionTuple]:
+        return [(s.position.x, s.position.y) for s in team.spawners]
+
+    @staticmethod
+    def _enemy_spawner_positions(world: GameWorld, my_id: str) -> List[PositionTuple]:
+        out: List[PositionTuple] = []
+        for spw in world.spawners:
+            if spw.teamId != my_id:
+                out.append((spw.position.x, spw.position.y))
+        return out
 
     # ----------------------------
     # Strength maps + safety checks
@@ -152,7 +195,6 @@ class Bot:
 
         enemy_margin = ENEMY_MARGIN_AFTER_AGGRO if tick >= AGGRO_TICK else ENEMY_MARGIN_BEFORE_AGGRO
 
-        # Need strictly stronger than occupant (+ margin)
         if e > 0 and spore_biomass <= e + enemy_margin:
             return False
         if n > 0 and spore_biomass <= n + NEUTRAL_MARGIN:
@@ -160,20 +202,61 @@ class Bot:
         return True
 
     # ----------------------------
-    # Identify enemy spawners positions
-    # (If enemy spawner exists, moving onto it should destroy it in most rulesets;
-    # if not, this still forces contest.)
+    # Role assignment: more attackers
     # ----------------------------
-    @staticmethod
-    def _enemy_spawner_positions(world: GameWorld, my_id: str) -> List[PositionTuple]:
-        out: List[PositionTuple] = []
-        for spw in world.spawners:
-            if spw.teamId != my_id:
-                out.append((spw.position.x, spw.position.y))
-        return out
+    def _assign_roles(self, team: TeamInfo) -> Dict[str, str]:
+        roles: Dict[str, str] = {}
+        spores_sorted = sorted(team.spores, key=lambda s: s.biomass, reverse=True)
+
+        desired_attackers = max(ATTACKERS_MIN, len(spores_sorted) // ATTACKERS_DIV) if len(spores_sorted) >= 3 else 1
+        attackers = {s.id for s in spores_sorted[:desired_attackers]}
+
+        for s in spores_sorted:
+            roles[s.id] = "ATTACK" if s.id in attackers else "EXPAND"
+        return roles
 
     # ----------------------------
-    # Hub selection (fast, more aggressive + spawner hunt)
+    # Economy: still generate spores + sometimes spawners
+    # ----------------------------
+    @staticmethod
+    def _should_create_spawner(team: TeamInfo, tick: int) -> bool:
+        if len(team.spawners) >= MAX_SPAWNERS_SOFT:
+            return False
+        if team.nextSpawnerCost <= SPAWNER_COST_ALWAYS_OK_UNTIL:
+            return True
+        if tick < SPAWNER_EARLY_TICK and team.nextSpawnerCost <= SPAWNER_COST_OK_EARLY_UNTIL:
+            return True
+        return False
+
+    def _produce_spores(self, actions: List[Action], team: TeamInfo, tick: int):
+        nutrients = team.nutrients
+        desired_spores = DESIRED_SPORES_BASE + min(DESIRED_SPORES_MAX_EXTRA, nutrients // DESIRED_SPORES_PER_NUTRIENTS)
+
+        if len(team.spores) >= desired_spores:
+            return
+
+        for spawner in team.spawners:
+            if len(team.spores) >= desired_spores:
+                break
+
+            want_fighter = (tick >= 10) and (len(team.spores) % FIGHTER_EVERY_N == 0)
+            want_worker = (len(team.spores) % WORKER_EVERY_N == 0)
+
+            if want_fighter:
+                bio = FIGHTER_BIOMASS
+            elif want_worker:
+                bio = WORKER_BIOMASS
+            else:
+                bio = CLAIMER_BIOMASS
+
+            if team.nutrients < bio:
+                continue
+
+            actions.append(SpawnerProduceSporeAction(spawnerId=spawner.id, biomass=bio))
+            team.nutrients -= bio
+
+    # ----------------------------
+    # Hub selection: enemy tiles > nutrients, avoid neutral early
     # ----------------------------
     def _pick_best_hub(
         self,
@@ -181,18 +264,14 @@ class Bot:
         my_id: str,
         neutral_id: str,
         tick: int,
+        enemy_spawners: List[PositionTuple],
+        my_spawners: List[PositionTuple],
+        ref_pos: PositionTuple,
         enemy_strength: Dict[PositionTuple, int],
         neutral_strength: Dict[PositionTuple, int],
-        ref_pos: Optional[PositionTuple] = None,
     ) -> Optional[PositionTuple]:
-        """
-        Picks a hub for a spore. If ref_pos is provided, it adds a distance bias
-        (closer hubs preferred) to increase responsiveness and territory gain.
-        """
         best: Optional[PositionTuple] = None
-        best_score = -10**12
-
-        enemy_spawners = self._enemy_spawner_positions(world, my_id)
+        best_score = -10**18
 
         for y in range(world.map.height):
             row = world.map.nutrientGrid[y]
@@ -202,45 +281,54 @@ class Bot:
                     continue
 
                 p = (x, y)
-
                 if p in self.reserved_hubs and self.reserved_hubs[p] != "":
                     continue
 
                 owner = self._tile_owner(world, p)
 
-                score = v * 3  # higher weight on nutrients (resources tie-break + better hubs)
+                # Avoid neutral early (even if high nutrient) to not get blocked by neutral spores
+                if tick < NEUTRAL_HARD_AVOID_BEFORE and owner == neutral_id:
+                    continue
 
-                # avoid picking already-owned hubs
+                # hard safety skip for insane neutral stacks
+                if neutral_strength.get(p, 0) >= 10 and tick < 800:
+                    continue
+
+                score = v * 2
+
                 if owner == my_id and self._tile_biomass(world, p) >= 1:
                     score -= OWNED_BY_ME_PENALTY
 
-                # neutral bias
-                if owner == neutral_id:
-                    score += NEUTRAL_OWNED_BONUS
-
-                # enemy bias (earlier + stronger)
-                if tick >= AGGRO_TICK and owner not in (my_id, neutral_id):
+                # prefer enemy territory strongly (take soil / unblock)
+                if owner not in (my_id, neutral_id) and owner != "":
                     score += ENEMY_OWNED_BONUS
 
-                # spawner hunting: add huge bonus if this tile is (or is near) an enemy spawner
-                if tick <= CHASE_SPAWNER_BEFORE_TICK and enemy_spawners:
-                    # Manhattan distance to closest enemy spawner
-                    dmin = 10**9
-                    for spw_pos in enemy_spawners:
-                        d = self._manhattan(p, spw_pos)
-                        if d < dmin:
-                            dmin = d
+                    # frontline bias (enemy tiles near our spawners)
+                    if my_spawners:
+                        dmin = min(self._manhattan(p, q) for q in my_spawners)
+                        if dmin <= FRONTLINE_RADIUS_FROM_SPAWNERS:
+                            score += ENEMY_TILE_FRONTLINE_BONUS + (FRONTLINE_RADIUS_FROM_SPAWNERS - dmin) * 4
+
+                # penalize neutral (when allowed later)
+                if owner == neutral_id:
+                    score -= NEUTRAL_OWNED_PENALTY
+
+                # spawner hunt (huge)
+                if enemy_spawners and tick <= CHASE_SPAWNER_BEFORE_TICK:
+                    dmin = min(self._manhattan(p, spw) for spw in enemy_spawners)
                     if dmin == 0:
-                        score += SPAWNER_HUNT_BONUS  # tile IS enemy spawner
+                        score += SPAWNER_HUNT_BONUS
                     elif dmin <= SPAWNER_HUNT_RADIUS:
                         score += max(0, SPAWNER_HUNT_BONUS - dmin * 30)
 
-                # distance bias to be more responsive (helps actions executed and territory gain)
-                if ref_pos is not None:
-                    score -= self._manhattan(ref_pos, p) * 2
+                # distance bias (be responsive)
+                score -= self._manhattan(ref_pos, p) * 2
 
-                # avoid "impossible" hubs very early
-                if enemy_strength.get(p, 0) >= 18 and tick < AGGRO_TICK:
+                # avoid impossible hubs early
+                if tick < AGGRO_TICK and enemy_strength.get(p, 0) >= 16:
+                    continue
+                if tick < NEUTRAL_HARD_AVOID_BEFORE and neutral_strength.get(p, 0) > 0:
+                    # if it's occupied by neutral spores, avoid completely early
                     continue
 
                 if score > best_score:
@@ -258,22 +346,18 @@ class Bot:
         if r <= 0:
             return pts
 
-        # top
         for x in range(hx - r, hx + r + 1):
             y = hy - r
             if self._in_bounds(world, x, y):
                 pts.append((x, y))
-        # right
         for y in range(hy - r + 1, hy + r + 1):
             x = hx + r
             if self._in_bounds(world, x, y):
                 pts.append((x, y))
-        # bottom
         for x in range(hx + r - 1, hx - r - 1, -1):
             y = hy + r
             if self._in_bounds(world, x, y):
                 pts.append((x, y))
-        # left
         for y in range(hy + r - 1, hy - r, -1):
             x = hx - r
             if self._in_bounds(world, x, y):
@@ -310,6 +394,10 @@ class Bot:
                 if self._owned_by_me(world, my_id, p):
                     continue
 
+                # Avoid neutral tiles early even during ring-fill
+                if tick < NEUTRAL_HARD_AVOID_BEFORE and self._tile_owner(world, p) == neutral_id:
+                    continue
+
                 if not self._safe_to_enter(p, spore_biomass, tick, enemy_strength, neutral_strength):
                     continue
 
@@ -322,43 +410,64 @@ class Bot:
         return None
 
     # ----------------------------
-    # Economy knobs
+    # One-step greedy to force stealing (avoids being "blocked")
     # ----------------------------
-    @staticmethod
-    def _should_create_spawner(team: TeamInfo, tick: int) -> bool:
-        if team.nextSpawnerCost <= SPAWNER_COST_ALWAYS_OK_UNTIL:
-            return True
-        if tick < SPAWNER_EARLY_TICK and team.nextSpawnerCost <= SPAWNER_COST_OK_EARLY_UNTIL:
-            return True
-        return False
+    def _choose_one_step(
+        self,
+        world: GameWorld,
+        my_id: str,
+        neutral_id: str,
+        tick: int,
+        sp: Spore,
+        target: PositionTuple,
+        enemy_strength: Dict[PositionTuple, int],
+        neutral_strength: Dict[PositionTuple, int],
+    ) -> Optional[PositionTuple]:
+        start = (sp.position.x, sp.position.y)
+        dist0 = self._manhattan(start, target)
 
-    def _produce_spores(self, actions: List[Action], team: TeamInfo, tick: int):
-        nutrients = team.nutrients
-        desired_spores = DESIRED_SPORES_BASE + min(DESIRED_SPORES_MAX_EXTRA, nutrients // DESIRED_SPORES_PER_NUTRIENTS)
+        best: Optional[PositionTuple] = None
+        best_score = -10**18
 
-        if len(team.spores) >= desired_spores:
-            return
-
-        for spawner in team.spawners:
-            if len(team.spores) >= desired_spores:
-                break
-
-            # more aggression: inject fighters regularly
-            want_fighter = (tick >= 30) and (len(team.spores) % FIGHTER_EVERY_N == 0)
-            want_worker = (len(team.spores) % WORKER_EVERY_N == 0)
-
-            if want_fighter:
-                bio = FIGHTER_BIOMASS
-            elif want_worker:
-                bio = WORKER_BIOMASS
-            else:
-                bio = CLAIMER_BIOMASS
-
-            if team.nutrients < bio:
+        for nb in self._neighbors(world, start):
+            if not self._safe_to_enter(nb, sp.biomass, tick, enemy_strength, neutral_strength):
                 continue
 
-            actions.append(SpawnerProduceSporeAction(spawnerId=spawner.id, biomass=bio))
-            team.nutrients -= bio
+            owner = self._tile_owner(world, nb)
+            is_enemy_tile = owner not in (my_id, neutral_id) and owner != ""
+            is_neutral_tile = owner == neutral_id
+
+            # avoid neutral tiles early
+            if tick < NEUTRAL_HARD_AVOID_BEFORE and is_neutral_tile:
+                continue
+
+            dist1 = self._manhattan(nb, target)
+            closer = dist0 - dist1
+
+            score = closer * STEP_CLOSER_WEIGHT
+            score += self._nut(world, nb) * STEP_NUTRIENT_WEIGHT
+
+            if not self._owned_by_me(world, my_id, nb):
+                score += STEP_STEAL_BONUS
+
+            if is_enemy_tile:
+                score += STEP_ENEMY_TILE_BONUS
+
+            if is_neutral_tile:
+                score -= STEP_NEUTRAL_TILE_PENALTY
+
+            if self._owned_by_me(world, my_id, nb):
+                score += STEP_FREE_TRACE_BONUS
+
+            # stepping onto enemy spore = instant win (safe_to_enter ensured)
+            if nb in enemy_strength:
+                score += 320
+
+            if score > best_score:
+                best_score = score
+                best = nb
+
+        return best
 
     # ----------------------------
     # Main decision
@@ -373,12 +482,14 @@ class Bot:
         neutral_id = game_message.constants.neutralTeamId
 
         enemy_strength, neutral_strength = self._build_strength_maps(world, my_id, neutral_id)
+        enemy_spawners = self._enemy_spawner_positions(world, my_id)
+        my_spawners = self._my_spawner_positions(my_team)
 
         # 0) No units
         if len(my_team.spores) == 0 and len(my_team.spawners) == 0:
             return actions
 
-        # 1) Avoid elimination: ensure at least 1 spawner
+        # 1) Ensure at least 1 spawner
         if len(my_team.spawners) == 0:
             if len(my_team.spores) > 0:
                 s = my_team.spores[0]
@@ -387,10 +498,11 @@ class Bot:
                     actions.append(SporeCreateSpawnerAction(sporeId=s.id))
             return actions
 
-        # 2) Produce spores (territory + pressure)
+        # 2) Roles + production
+        roles = self._assign_roles(my_team)
         self._produce_spores(actions, my_team, tick)
 
-        # 3) Cleanup plans for dead spores
+        # 3) Cleanup plans
         live_ids = {s.id for s in my_team.spores}
         for sid in list(self.plans.keys()):
             if sid not in live_ids:
@@ -399,7 +511,7 @@ class Bot:
                     del self.reserved_hubs[old_hub]
                 del self.plans[sid]
 
-        # 4) Assign plans / hubs
+        # 4) Assign hubs / ring sizes
         ring_max = RING_MAX_EARLY if tick < 200 else (RING_MAX_MID if tick < 600 else RING_MAX_LATE)
 
         for sp in my_team.spores:
@@ -408,22 +520,22 @@ class Bot:
 
             plan = self.plans[sp.id]
             plan.ring_max = ring_max
+            plan.role = roles.get(sp.id, "EXPAND")
 
             sp_pos = (sp.position.x, sp.position.y)
+            hub_invalid = plan.hub is None or (plan.hub in self.reserved_hubs and self.reserved_hubs[plan.hub] != sp.id)
 
-            hub_invalid = (
-                plan.hub is None
-                or (plan.hub in self.reserved_hubs and self.reserved_hubs[plan.hub] != sp.id)
-            )
             if hub_invalid:
                 hub = self._pick_best_hub(
                     world=world,
                     my_id=my_id,
                     neutral_id=neutral_id,
                     tick=tick,
+                    enemy_spawners=enemy_spawners,
+                    my_spawners=my_spawners,
+                    ref_pos=sp_pos,
                     enemy_strength=enemy_strength,
                     neutral_strength=neutral_strength,
-                    ref_pos=sp_pos,
                 )
                 if hub is not None:
                     plan.hub = hub
@@ -432,9 +544,9 @@ class Bot:
                     plan.ring_i = 0
                     self.reserved_hubs[hub] = sp.id
 
-        # 5) Create spawners while cheap, but also prioritize building on high nutrient tiles
+        # 5) Create spawners (still), prefer enemy/high nutrient tiles
         if self._should_create_spawner(my_team, tick):
-            for sp in my_team.spores:
+            for sp in sorted(my_team.spores, key=lambda s: s.biomass, reverse=True):
                 if sp.biomass < max(2, my_team.nextSpawnerCost + 1):
                     continue
 
@@ -442,16 +554,18 @@ class Bot:
                 if self._has_spawner_at(world, p):
                     continue
 
-                # more spawner building => tie-break + more production => more territory/actions
-                if self._nut(world, p) >= NUTRIENT_FOR_SPAWNER or (tick >= AGGRO_TICK and self._tile_owner(world, p) != my_id):
+                owner = self._tile_owner(world, p)
+                is_enemy_tile = owner not in (my_id, neutral_id) and owner != ""
+
+                if self._nut(world, p) >= NUTRIENT_FOR_SPAWNER or (tick >= AGGRO_TICK and is_enemy_tile):
                     actions.append(SporeCreateSpawnerAction(sporeId=sp.id))
                     break
 
         used_spores = {a.sporeId for a in actions if hasattr(a, "sporeId")}
 
-        # 6) Movement: spawner hunting + aggressive ring claiming
-        enemy_spawners = self._enemy_spawner_positions(world, my_id)
-
+        # 6) Moves:
+        # - Attackers: hunt spawners, otherwise steal enemy soil (one-step)
+        # - Expanders: hub->ring, but also one-step after aggro to force recapture
         for sp in my_team.spores:
             if sp.id in used_spores:
                 continue
@@ -464,53 +578,53 @@ class Bot:
 
             sp_pos = (sp.position.x, sp.position.y)
 
-            # A) If we can directly move to an adjacent enemy spawner tile safely -> do it (destroy it)
-            moved = False
-            if enemy_spawners and tick <= CHASE_SPAWNER_BEFORE_TICK:
+            # A) Adjacent enemy spawner capture
+            if plan.role == "ATTACK" and enemy_spawners and tick <= CHASE_SPAWNER_BEFORE_TICK:
                 for dx, dy in DIRS:
                     nb = (sp_pos[0] + dx, sp_pos[1] + dy)
                     if not self._in_bounds(world, nb[0], nb[1]):
                         continue
                     if nb in enemy_spawners and self._safe_to_enter(nb, sp.biomass, tick, enemy_strength, neutral_strength):
                         actions.append(SporeMoveAction(sporeId=sp.id, direction=Position(x=dx, y=dy)))
-                        moved = True
                         break
-            if moved:
+                else:
+                    # B) If close to a spawner, chase it via one-step greedy (avoids neutral blocks)
+                    target: Optional[PositionTuple] = None
+                    if enemy_spawners:
+                        nearest = min(enemy_spawners, key=lambda ep: self._manhattan(sp_pos, ep))
+                        if self._manhattan(sp_pos, nearest) <= SPAWNER_HUNT_RADIUS:
+                            target = nearest
+                    if target is None:
+                        target = plan.hub
+
+                    if target is None:
+                        continue
+
+                    step = self._choose_one_step(world, my_id, neutral_id, tick, sp, target, enemy_strength, neutral_strength)
+                    if step is None:
+                        continue
+                    actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to_pos(sp_pos, step)))
                 continue
 
-            # B) If enemy spawners exist, sometimes override hub to chase nearest one (aggressive)
-            if enemy_spawners and tick <= CHASE_SPAWNER_BEFORE_TICK and tick >= 20:
-                # pick nearest spawner
-                nearest = None
-                dmin = 10**9
-                for ep in enemy_spawners:
-                    d = self._manhattan(sp_pos, ep)
-                    if d < dmin:
-                        dmin = d
-                        nearest = ep
-                # if close enough and safe-ish, chase it
-                if nearest is not None and dmin <= SPAWNER_HUNT_RADIUS:
-                    # Use MoveTo to let server pathfind; safety checks still filter ring targets,
-                    # and we also avoid obviously losing tiles via _safe_to_enter on immediate adjacency above.
-                    actions.append(SporeMoveToAction(sporeId=sp.id, position=Position(x=nearest[0], y=nearest[1])))
-                    continue
-
-            # C) Regular plan behavior: SEEK hub -> RING
+            # EXPAND behavior
             if plan.hub is None:
-                hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength, ref_pos=sp_pos)
-                if hub is None:
-                    continue
-                plan.hub = hub
-                self.reserved_hubs[hub] = sp.id
-                plan.mode = "SEEK"
-                plan.ring_r = 1
-                plan.ring_i = 0
+                continue
 
-            # If hub is unsafe for this spore, repick (prevents suicides)
+            # If hub is unsafe for this spore, repick
             if not self._safe_to_enter(plan.hub, sp.biomass, tick, enemy_strength, neutral_strength):
                 if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                     del self.reserved_hubs[plan.hub]
-                new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength, ref_pos=sp_pos)
+                new_hub = self._pick_best_hub(
+                    world=world,
+                    my_id=my_id,
+                    neutral_id=neutral_id,
+                    tick=tick,
+                    enemy_spawners=enemy_spawners,
+                    my_spawners=my_spawners,
+                    ref_pos=sp_pos,
+                    enemy_strength=enemy_strength,
+                    neutral_strength=neutral_strength,
+                )
                 if new_hub is not None:
                     plan.hub = new_hub
                     self.reserved_hubs[new_hub] = sp.id
@@ -518,6 +632,27 @@ class Bot:
                     plan.ring_r = 1
                     plan.ring_i = 0
 
+            # After AGGRO_TICK, use one-step greedy even for expanders to steal territory / avoid blocks
+            if tick >= AGGRO_TICK:
+                # pick ring target first (steal nearby), else go hub
+                target = self._next_ring_target(
+                    world=world,
+                    my_id=my_id,
+                    neutral_id=neutral_id,
+                    tick=tick,
+                    spore_biomass=sp.biomass,
+                    plan=plan,
+                    enemy_strength=enemy_strength,
+                    neutral_strength=neutral_strength,
+                ) or plan.hub
+
+                step = self._choose_one_step(world, my_id, neutral_id, tick, sp, target, enemy_strength, neutral_strength)
+                if step is None:
+                    continue
+                actions.append(SporeMoveAction(sporeId=sp.id, direction=self._dir_to_pos(sp_pos, step)))
+                continue
+
+            # Early: SEEK hub -> RING using MoveTo
             if plan.mode == "SEEK":
                 if sp_pos != plan.hub:
                     actions.append(SporeMoveToAction(sporeId=sp.id, position=Position(x=plan.hub[0], y=plan.hub[1])))
@@ -537,13 +672,21 @@ class Bot:
                     enemy_strength=enemy_strength,
                     neutral_strength=neutral_strength,
                 )
-
                 if target is None:
-                    # finished ring: pick next hub (aggressive scoring will pull toward enemy/spawner areas)
                     if plan.hub is not None and self.reserved_hubs.get(plan.hub) == sp.id:
                         del self.reserved_hubs[plan.hub]
 
-                    new_hub = self._pick_best_hub(world, my_id, neutral_id, tick, enemy_strength, neutral_strength, ref_pos=sp_pos)
+                    new_hub = self._pick_best_hub(
+                        world=world,
+                        my_id=my_id,
+                        neutral_id=neutral_id,
+                        tick=tick,
+                        enemy_spawners=enemy_spawners,
+                        my_spawners=my_spawners,
+                        ref_pos=sp_pos,
+                        enemy_strength=enemy_strength,
+                        neutral_strength=neutral_strength,
+                    )
                     if new_hub is not None:
                         plan.hub = new_hub
                         self.reserved_hubs[new_hub] = sp.id
