@@ -3,6 +3,9 @@ __pycache__/
 .idea
 .vscode
 
+# Qualification binaries and large files
+qualification/
+
 #
 # Python
 ### Python ###
