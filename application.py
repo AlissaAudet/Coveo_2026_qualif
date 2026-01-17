@@ -26,7 +26,7 @@ async def run():
             )
         else:
             await websocket.send(
-                json.dumps({"type": "REGISTER", "teamName": "MyPythonicBot"})
+                json.dumps({"type": "REGISTER", "teamName": "MyPythonicBot2"})
             )
 
         await game_loop(websocket=websocket, bot=bot)
